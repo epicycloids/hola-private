@@ -1,0 +1,80 @@
+"""Command-line script to run HOLA optimization server.
+
+This script starts a server that handles multiple concurrent optimization
+sessions, each in its own directory under the specified root directory.
+"""
+
+import argparse
+from pathlib import Path
+from wsgiref import simple_server
+import sys
+from typing import NoReturn
+
+from hola.multiclient_server import create_multiclient_server
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments.
+
+    :return: Parsed arguments
+    :rtype: argparse.Namespace
+    """
+    parser = argparse.ArgumentParser(
+        description="Start HOLA optimization server for multiple clients"
+    )
+    parser.add_argument(
+        "-d", "--dir",
+        default=".",
+        help="Root directory for storing HOLA session data"
+    )
+    parser.add_argument(
+        "-p", "--port",
+        type=int,
+        default=8675,
+        help="Port number for HOLA server"
+    )
+    parser.add_argument(
+        "--hostname",
+        default="",
+        help="Hostname for HOLA server (default: all interfaces)"
+    )
+    return parser.parse_args()
+
+
+def main() -> NoReturn:
+    """Run the HOLA server.
+
+    Creates and runs a WSGI server that handles HOLA optimization sessions.
+    Server runs indefinitely until interrupted.
+
+    :raises OSError: If unable to create/access directory or start server
+    """
+    args = parse_args()
+
+    try:
+        app = create_multiclient_server(args.dir)
+        server = simple_server.make_server(
+            args.hostname,
+            args.port,
+            app
+        )
+        server.timeout = 1
+
+        host_display = args.hostname if args.hostname else "0.0.0.0"
+        print(f"HOLA server listening on {host_display}:{args.port}")
+        print(f"Using session directory: {Path(args.dir).resolve()}")
+        print("Press Ctrl+C to stop server")
+
+        while True:
+            server.handle_request()
+
+    except KeyboardInterrupt:
+        print("\nServer stopped by user")
+        sys.exit(0)
+    except OSError as e:
+        print(f"Error starting server: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

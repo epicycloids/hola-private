@@ -1,0 +1,55 @@
+[tool.poetry]
+name = "hola"
+version = "0.1.0"
+description = ""
+authors = ["Logan Bell <epicycloids@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+sortedcontainers = "^2.4.0"
+numpy = "^2.2.0"
+pandas = "^2.2.3"
+falcon = "^4.0.2"
+pydantic = "^2.10.3"
+scipy = "^1.14.1"
+scikit-learn = "^1.6.0"
+requests = "^2.32.3"
+multiprocess = "^0.70.17"
+pytest = "^8.3.4"
+filelock = "^3.16.1"
+aiohttp = "^3.11.11"
+tqdm = "^4.67.1"
+fastapi = "^0.115.6"
+uvicorn = "^0.34.0"
+
+
+[tool.poetry.group.dev.dependencies]
+flake8 = "^7.1.1"
+isort = "^5.13.2"
+black = "^24.10.0"
+pre-commit = "^4.0.1"
+flake8-pyproject = "^1.2.3"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+known_first_party = ["hola"]
+
+[tool.flake8]
+max-line-length = 100
+ignore = ["E203", "W503"]
+exclude = ["__pycache__", ".venv", "build", "dist"]
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    "ignore:The balance properties of Sobol' points:UserWarning"
+]
