@@ -22,6 +22,17 @@ aiohttp = "^3.11.11"
 tqdm = "^4.67.1"
 fastapi = "^0.115.6"
 uvicorn = "^0.34.0"
+sortedcontainers-stubs = "^2.4.2"
+mypy = "^1.14.1"
+scipy-stubs = "^1.15.0.0"
+pandas-stubs = "^2.2.3.241126"
+zmq = "^0.0.0"
+psutil = "^6.1.1"
+plotly = "^5.24.1"
+msgspec = "^0.19.0"
+types-psutil = "^6.1.0.20241221"
+websockets = "^14.1"
+pytest-asyncio = "^0.25.2"
 
 
 [tool.poetry.group.dev.dependencies]
@@ -53,3 +64,8 @@ exclude = ["__pycache__", ".venv", "build", "dist"]
 filterwarnings = [
     "ignore:The balance properties of Sobol' points:UserWarning"
 ]
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.mypy]
+plugins = ['pydantic.mypy']
+
