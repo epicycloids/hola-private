@@ -7,8 +7,8 @@ from uuid import UUID
 from msgspec import Struct
 
 from hola.core.leaderboard import Leaderboard, Trial
-from hola.core.objectives import ObjectiveConfig, ObjectiveName, ObjectiveScorer
-from hola.core.parameters import PredefinedParameterConfig, ParameterName, ParameterTransformer
+from hola.core.objectives import ObjectiveName, ObjectiveScorer
+from hola.core.parameters import ParameterName, ParameterTransformer
 from hola.core.samplers import HypercubeSampler
 from hola.messages.worker import Evaluation
 
@@ -33,8 +33,8 @@ class OptimizationCoordinator:
     def from_dict(
         cls,
         hypercube_sampler: HypercubeSampler,
-        objectives_dict: dict[ObjectiveName, ObjectiveConfig],
-        parameters_dict: dict[ParameterName, PredefinedParameterConfig],
+        objectives_dict: dict[ObjectiveName, dict[str, Any]],
+        parameters_dict: dict[ParameterName, dict[str, Any]],
     ) -> "OptimizationCoordinator":
         objective_scorer = ObjectiveScorer.from_dict(objectives_dict)
         leaderboard = Leaderboard(objective_scorer)
@@ -79,17 +79,17 @@ class OptimizationCoordinator:
             self._active = True
 
     async def update_objective_config(
-        self, new_config: dict[ObjectiveName, ObjectiveConfig]
+        self, new_config: dict[ObjectiveName, dict[str, Any]]
     ) -> None:
         async with self._lock:
-            new_scorer = ObjectiveScorer(new_config)
+            new_scorer = ObjectiveScorer.from_dict(new_config)
             self.leaderboard.update_objective_scorer(new_scorer)
             self._update_elite_samples()
 
-    async def update_parameter_config(self, new_config: dict[str, PredefinedParameterConfig]) -> None:
+    async def update_parameter_config(self, new_config: dict[str, dict[str, Any]]) -> None:
         async with self._lock:
             # Check for domain expansion
-            new_transformer = ParameterTransformer(new_config)
+            new_transformer = ParameterTransformer.from_dict(new_config)
             should_restart_sampler = new_transformer.has_expanded_domain(self.parameter_transformer)
 
             # Update parameter transformer

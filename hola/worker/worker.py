@@ -1,156 +1,124 @@
 import asyncio
 import logging
-from typing import Any, Callable
-from uuid import UUID, uuid4
+from datetime import datetime, timezone
+from typing import Callable
 
 import msgspec
 import zmq
 import zmq.asyncio
-from zmq.log.handlers import PUBHandler
 
-from hola.core.objectives import ObjectiveName
-from hola.server.messages.server import Error, ServerMessage
-from hola.server.messages.worker import SampleRequest
-from hola.worker.base import WorkerState
-from hola.worker.config import WorkerConfig
-from hola.worker.handler import ServerMessageHandler
+from hola.messages.errors import ErrorDomain, ErrorSeverity, StructuredError
+from hola.messages.server import SampleResponse, ServerMessage
+from hola.messages.worker import (
+    Evaluation,
+    HeartbeatPing,
+    SampleRequest,
+    WorkerDeregistration,
+    WorkerError,
+    WorkerRegistration,
+)
+from hola.server.config import ConnectionConfig
+
+logger = logging.getLogger(__name__)
 
 
-class Worker:
-    """A worker that executes objective function evaluations."""
-
-    def __init__(
-        self,
-        objective_fn: Callable[..., dict[ObjectiveName, float]],
-        config: WorkerConfig | None = None,
-    ):
-        self.config = config or WorkerConfig()
-        self.worker_id = UUID(bytes=uuid4().bytes)
-        self._running = False
-
-        # Set up logging
-        self.logger = logging.getLogger(f"hola.worker.{self.worker_id}")
-        self.logger.setLevel(logging.INFO)
-
-        # Initialize state and message handler
-        self.state = WorkerState(
-            worker_id=self.worker_id, objective_fn=objective_fn, logger=self.logger
-        )
-        self.message_handler = ServerMessageHandler()
-
-        # Initialize ZMQ context and sockets
+class OptimizationWorker:
+    def __init__(self, config: ConnectionConfig, evaluation_fn: Callable[..., dict[str, float]]):
+        self.config = config
+        self.evaluation_fn = evaluation_fn
         self.context = zmq.asyncio.Context()
-        self.dealer = self.context.socket(zmq.DEALER)
-        self.dealer.setsockopt(zmq.IDENTITY, str(self.worker_id).encode())
-        self.dealer.setsockopt(zmq.LINGER, 0)
+        self.socket = self.context.socket(zmq.DEALER)
+        self.is_running = False
 
-        # Connect to log publisher
-        self.log_sub = self.context.socket(zmq.SUB)
-        self.log_sub.setsockopt(zmq.SUBSCRIBE, b"")
+    async def start(self):
+        """Start the worker and begin processing."""
+        self.socket.connect(self.config.worker_uri)
+        self.is_running = True
 
-        self._connect_sockets()
+        # Register with server
+        await self._send_registration()
 
-        # Add ZMQ logging handler
-        handler = PUBHandler(self.log_sub)
-        handler.setLevel(logging.INFO)
-        formatter = logging.Formatter(
-            f"%(asctime)s - Worker {self.worker_id} - %(levelname)s - %(message)s"
-        )
-        handler.setFormatter(formatter)
-        self.logger.addHandler(handler)
+        # Start main tasks
+        await asyncio.gather(self._process_messages(), self._send_heartbeats())
 
-    def _connect_sockets(self) -> None:
-        """Connect to server sockets."""
-        if self.config.transport == "tcp":
-            self.dealer.connect(f"tcp://{self.config.host}:{self.config.port}")
-            self.log_sub.connect(f"tcp://{self.config.host}:{self.config.log_port}")
-        else:
-            self.dealer.connect(f"ipc://{self.config.socket_path}")
-            self.log_sub.connect(f"ipc://{self.config.log_socket_path}")
+    async def stop(self):
+        """Stop the worker gracefully."""
+        self.is_running = False
+        await self._send_deregistration()
+        self.socket.close()
+        self.context.term()
 
-    async def _reconnect(self) -> None:
-        """Attempt to reconnect to the server with retries."""
-        for attempt in range(self.config.max_retries):
+    async def _send_registration(self):
+        """Send registration message to server."""
+        message = WorkerRegistration(timestamp=datetime.now(timezone.utc), capabilities={})
+        await self.socket.send(msgspec.json.encode(message))
+
+        # Immediately request first sample after registration
+        sample_request = SampleRequest(timestamp=datetime.now(timezone.utc), n_samples=1)
+        await self.socket.send(msgspec.json.encode(sample_request))
+
+    async def _send_deregistration(self):
+        """Send deregistration message to server."""
+        message = WorkerDeregistration(timestamp=datetime.now(timezone.utc))
+        await self.socket.send(msgspec.json.encode(message))
+
+    async def _send_heartbeats(self):
+        """Periodically send heartbeat messages."""
+        while self.is_running:
+            now = datetime.now(timezone.utc)
+            message = HeartbeatPing(timestamp=now, last_active=now, current_load=0)
+            await self.socket.send(msgspec.json.encode(message))
+            await asyncio.sleep(30)  # Heartbeat every 30 seconds
+
+    async def _process_messages(self):
+        """Process incoming messages from the server."""
+        while self.is_running:
             try:
-                self.dealer.close()
-                self.log_sub.close()
+                message = await self.socket.recv()
+                server_msg = msgspec.json.decode(message, type=ServerMessage)
+                logger.debug(f"Received server message: {server_msg}")
 
-                self.dealer = self.context.socket(zmq.DEALER)
-                self.dealer.setsockopt(zmq.IDENTITY, str(self.worker_id).encode())
-                self.dealer.setsockopt(zmq.LINGER, 0)
+                match server_msg:
+                    case SampleResponse(samples=samples):
+                        logger.info(f"Received {len(samples)} samples for evaluation")
+                        # Process parameter samples and evaluate
+                        for params in samples:
+                            try:
+                                logger.debug(f"Evaluating parameters: {params}")
+                                objectives = await self.evaluation_fn(**params)
+                                logger.debug(f"Evaluation result: {objectives}")
 
-                self.log_sub = self.context.socket(zmq.SUB)
-                self.log_sub.setsockopt(zmq.SUBSCRIBE, b"")
+                                eval_msg = Evaluation(
+                                    timestamp=datetime.now(timezone.utc),
+                                    parameters=params,
+                                    objectives=objectives,
+                                )
+                                await self.socket.send(msgspec.json.encode(eval_msg))
+                                logger.debug("Sent evaluation result")
 
-                self._connect_sockets()
-                return
+                                # Request next sample after evaluation
+                                sample_req = SampleRequest(
+                                    timestamp=datetime.now(timezone.utc), n_samples=1
+                                )
+                                await self.socket.send(msgspec.json.encode(sample_req))
+                                logger.debug("Requested next sample")
+
+                            except Exception as e:
+                                logger.error(f"Error evaluating parameters: {e}")
+                                error_msg = WorkerError(
+                                    timestamp=datetime.now(timezone.utc),
+                                    error=StructuredError(
+                                        code="EVALUATION_ERROR",
+                                        domain=ErrorDomain.SYSTEM,
+                                        severity=ErrorSeverity.ERROR,
+                                        message=str(e),
+                                    ),
+                                )
+                                await self.socket.send(msgspec.json.encode(error_msg))
+                    case _:
+                        logger.debug(f"Received unhandled message type: {type(server_msg)}")
 
             except Exception as e:
-                self.logger.error(f"Reconnection attempt {attempt + 1} failed: {e}")
-                if attempt < self.config.max_retries - 1:
-                    await asyncio.sleep(self.config.retry_interval)
-                else:
-                    raise
-
-    async def _send_message(self, message: Any) -> None:
-        """Send a message to the server with retries."""
-        for attempt in range(self.config.max_retries):
-            try:
-                await self.dealer.send_multipart([b"", msgspec.json.encode(message)])
-                return
-            except Exception as e:
-                self.logger.error(f"Failed to send message (attempt {attempt + 1}): {e}")
-                if attempt < self.config.max_retries - 1:
-                    await self._reconnect()
-                else:
-                    raise
-
-    async def _receive_message(self) -> ServerMessage:
-        """Receive and parse a message from the server with retries."""
-        for attempt in range(self.config.max_retries):
-            try:
-                _, response_bytes = await self.dealer.recv_multipart()
-                return msgspec.convert(msgspec.json.decode(response_bytes), ServerMessage)
-            except Exception as e:
-                self.logger.error(f"Failed to receive message (attempt {attempt + 1}): {e}")
-                if attempt < self.config.max_retries - 1:
-                    await self._reconnect()
-                else:
-                    raise
-
-    async def run(self) -> None:
-        """Run the worker's main loop."""
-        self._running = True
-        self.logger.info("Worker starting")
-
-        try:
-            while self._running:
-                try:
-                    # Request work
-                    request = SampleRequest(n_samples=1)
-                    await self._send_message(request)
-
-                    # Handle response
-                    response = await self._receive_message()
-                    result = await self.message_handler.handle_message(response, self.state)
-
-                    # Send result if we got one
-                    if result is not None:
-                        await self._send_message(result)
-                        ack = await self._receive_message()
-                        if isinstance(ack, Error):
-                            self.logger.error(f"Server error: {ack.message}")
-                            await asyncio.sleep(self.config.retry_interval)
-
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    self.logger.error(f"Error in main loop: {e}")
-                    await asyncio.sleep(self.config.retry_interval)
-
-        finally:
-            self._running = False
-            self.dealer.close()
-            self.log_sub.close()
-            self.context.term()
-            self.logger.info("Worker stopped")
+                logger.error(f"Error processing server message: {e}", exc_info=True)
+                if self.is_running:
+                    await asyncio.sleep(1)  # Brief pause before retry if still running

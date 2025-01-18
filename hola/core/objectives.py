@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TypeAlias
+from typing import Any, TypeAlias
 
 import msgspec
 import numpy as np
@@ -62,12 +62,12 @@ class ObjectiveConfig(Struct, frozen=True):
 
 
 @dataclass
-class ObjectiveScorer(Struct):
+class ObjectiveScorer:
     objectives: dict[ObjectiveName, ObjectiveConfig]
     _group_id_map: dict[GroupId, int] = field(default_factory=dict, init=False)
 
     @classmethod
-    def from_dict(cls, objectives_dict: dict) -> "ObjectiveScorer":
+    def from_dict(cls, objectives_dict: dict[ObjectiveName, dict[str, Any]]) -> "ObjectiveScorer":
         return cls(
             objectives=msgspec.convert(objectives_dict, dict[ObjectiveName, ObjectiveConfig])
         )

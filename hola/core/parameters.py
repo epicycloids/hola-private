@@ -87,11 +87,13 @@ class ContinuousParameterConfig(BaseParameterConfig, tag="continuous", frozen=Tr
     def unnormalize(self, u: float | FloatArray) -> float | FloatArray:
         """Transform normalized values to continuous parameter values."""
         self.validate_unit_float(u)
-        u = np.asarray(u)
         if self.scale == Scale.LINEAR:
-            return self.min + u * (self.max - self.min)
+            result = self.min + u * (self.max - self.min)
         else:
-            return self.min * np.exp(u * np.log(self.max / self.min))
+            result = self.min * np.exp(u * np.log(self.max / self.min))
+        if isinstance(u, np.ndarray):
+            return result
+        return float(result)
 
     @overload
     def normalize(self, x: float) -> float: ...
@@ -151,7 +153,7 @@ class CategoricalParameterConfig(
         """Transform normalized values to categorical parameter values."""
         self.validate_unit_float(u)
         idx = uniform_to_category(u, self.n_categories)
-        if isinstance(u, np.ndarray):
+        if isinstance(u, np.ndarray) and u.ndim > 0:
             return np.array([self.categories[int(i)] for i in idx.flatten()]).reshape(u.shape)
         return self.categories[int(idx)]
 
@@ -169,7 +171,7 @@ class CategoricalParameterConfig(
             else:
                 raise ParamInfeasibleError(f"Value {repr(x)} not in categories: [{valid_cats}]")
 
-        if isinstance(x, np.ndarray):
+        if isinstance(x, np.ndarray) and x.ndim > 0:
             indices = np.array([self.categories.index(xi) for xi in x.flat])
             return ((indices + 0.5) / self.n_categories).reshape(x.shape)
         else:
@@ -215,7 +217,7 @@ class IntegerParameterConfig(BaseParameterConfig, tag="integer", frozen=True):
         """Transform normalized values to integer parameter values."""
         self.validate_unit_float(u)
         idx = uniform_to_category(u, self.num_values)
-        if isinstance(u, np.ndarray):
+        if isinstance(u, np.ndarray) and u.ndim > 0:
             return (self.min + idx).astype(int).reshape(u.shape)
         return int(self.min + idx)
 
@@ -274,7 +276,7 @@ class LatticeParameterConfig(BaseParameterConfig, tag="lattice", frozen=True):
     def unnormalize(self, u: float | FloatArray) -> float | FloatArray:
         self.validate_unit_float(u)
         idx = uniform_to_category(u, self.num_values)
-        if isinstance(u, np.ndarray):
+        if isinstance(u, np.ndarray) and u.ndim > 0:
             return (self.min + idx * self.step_size).astype(float).reshape(u.shape)
         return float(self.min + idx * self.step_size)
 

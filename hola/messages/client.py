@@ -1,64 +1,63 @@
-from struct import Struct
 from typing import Any, TypeAlias, Union
 
-from hola.core.objectives import ObjectiveConfig, ObjectiveName
-from hola.core.parameters import ParameterName, PredefinedParameterConfig
+from hola.core.objectives import ObjectiveName
+from hola.core.parameters import ParameterName
 from hola.messages.base import BaseMessage
 from hola.messages.errors import StructuredError
 
 
-class InitializeRequestContent(Struct, frozen=True, tag="initialize"):
+class BaseClientMessage(BaseMessage, frozen=True):
+    pass
+
+
+class InitializeRequest(BaseClientMessage, frozen=True, tag="initialize"):
     # TODO: Need some way to initialize the Sampler. It will currently
     # initialize an explore/exploit sampler with a Sobol' explorer and a GMM
     # exploiter.
-    objectives_config: dict[ObjectiveName, dict[str, Any] | ObjectiveConfig]
-    parameters_config: dict[ParameterName, dict[str, Any] | PredefinedParameterConfig]
+    objectives_config: dict[ObjectiveName, dict[str, Any]]
+    parameters_config: dict[ParameterName, dict[str, Any]]
 
 
-class StatusRequestContent(Struct, frozen=True, tag="status"):
+class StatusRequest(BaseClientMessage, frozen=True, tag="status"):
     pass
 
 
-class PauseRequestContent(Struct, frozen=True, tag="pause"):
+class PauseRequest(BaseClientMessage, frozen=True, tag="pause"):
     pass
 
 
-class ResumeRequestContent(Struct, frozen=True, tag="resume"):
+class ResumeRequest(BaseClientMessage, frozen=True, tag="resume"):
     pass
 
 
-class UpdateObjectiveConfigContent(Struct, frozen=True, tag="update_objective_config"):
-    new_config: dict[ObjectiveName, dict[str, Any] | ObjectiveConfig]
+class UpdateObjectiveConfig(BaseClientMessage, frozen=True, tag="update_objective_config"):
+    new_config: dict[ObjectiveName, dict[str, Any]]
 
 
-class UpdateParameterConfigContent(Struct, frozen=True, tag="update_parameter_config"):
-    new_config: dict[ParameterName, dict[str, Any] | PredefinedParameterConfig]
+class UpdateParameterConfig(BaseClientMessage, frozen=True, tag="update_parameter_config"):
+    new_config: dict[ParameterName, dict[str, Any]]
 
 
-class SaveStateRequestContent(Struct, frozen=True, tag="save_state"):
+class SaveStateRequest(BaseClientMessage, frozen=True, tag="save_state"):
     filepath: str
 
 
-class LoadStateRequestContent(Struct, frozen=True, tag="load_state"):
+class LoadStateRequest(BaseClientMessage, frozen=True, tag="load_state"):
     filepath: str
 
 
-class ClientErrorContent(Struct, frozen=True, tag="error"):
+class ClientError(BaseClientMessage, frozen=True, tag="error"):
     error: StructuredError
 
 
-ClientMessageContent: TypeAlias = Union[
-    InitializeRequestContent,
-    StatusRequestContent,
-    PauseRequestContent,
-    ResumeRequestContent,
-    UpdateObjectiveConfigContent,
-    UpdateParameterConfigContent,
-    SaveStateRequestContent,
-    LoadStateRequestContent,
-    ClientErrorContent,
+ClientMessage: TypeAlias = Union[
+    InitializeRequest,
+    StatusRequest,
+    PauseRequest,
+    ResumeRequest,
+    UpdateObjectiveConfig,
+    UpdateParameterConfig,
+    SaveStateRequest,
+    LoadStateRequest,
+    ClientError,
 ]
-
-
-class ClientMessage(BaseMessage, frozen=True):
-    content: ClientMessageContent
