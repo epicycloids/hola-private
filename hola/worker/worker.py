@@ -85,7 +85,7 @@ class OptimizationWorker:
                         for params in samples:
                             try:
                                 logger.debug(f"Evaluating parameters: {params}")
-                                objectives = await self.evaluation_fn(**params)
+                                objectives = self.evaluation_fn(**params)
                                 logger.debug(f"Evaluation result: {objectives}")
 
                                 eval_msg = Evaluation(

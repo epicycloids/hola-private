@@ -179,11 +179,14 @@ class OptimizationServer:
             logger.error(f"Error sending message to worker: {e}")
 
     async def _send_to_client(self, identity: bytes, message: ServerMessage):
-        """Send a message to a specific client."""
         try:
             await self.client_socket.send_multipart([identity, msgspec.json.encode(message)])
-        except Exception as e:
-            logger.error(f"Error sending message to client: {e}")
+        except zmq.ZMQError as e:
+            if e.errno == zmq.ETERM:
+                logger.debug("Context terminated, ignoring send error")
+            else:
+                logger.error(f"Client {identity!r} disconnected: {e}")
+                self.clients.discard(identity)
 
     async def _broadcast_to_clients(self, message: ServerMessage):
         """Broadcast a message to all connected clients."""
