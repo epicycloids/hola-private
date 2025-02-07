@@ -679,6 +679,23 @@ all = ["email-validator (>=2.0.0)", "fastapi-cli[standard] (>=0.0.5)", "httpx (>
 standard = ["email-validator (>=2.0.0)", "fastapi-cli[standard] (>=0.0.5)", "httpx (>=0.23.0)", "jinja2 (>=2.11.2)", "python-multipart (>=0.0.7)", "uvicorn[standard] (>=0.12.0)"]
 
 [[package]]
+name = "fastapi-msgspec"
+version = "0.1.0"
+description = "FastAPI msgspec integration"
+optional = false
+python-versions = ">=3.8"
+groups = ["main"]
+markers = "python_version <= \"3.11\" or python_version >= \"3.12\""
+files = [
+    {file = "fastapi_msgspec-0.1.0-py3-none-any.whl", hash = "sha256:84b63ad7b82fe6696b25a77f547568d2081f4bbe798355668d98f1aee304b13f"},
+    {file = "fastapi_msgspec-0.1.0.tar.gz", hash = "sha256:ba177f9cd9d05799cc1afe94e0fe73def06d93fcd38df5a91c91d8ad8bd1bb17"},
+]
+
+[package.dependencies]
+fastapi = "*"
+msgspec = "*"
+
+[[package]]
 name = "filelock"
 version = "3.16.1"
 description = "A platform independent file lock."
@@ -3469,4 +3486,4 @@ pyzmq = "*"
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.10"
-content-hash = "e91683654130050fb9f7bd656962d4cde5c4693bb7bf95aa8649dddb3ac3161b"
+content-hash = "37d6056ff745845e40718d8359395ef4ca6a0c73884e3abbfe38b78b3f75d72c"

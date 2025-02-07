@@ -1,207 +1,242 @@
-import asyncio
+"""
+High-level system interface for hyperparameter optimization.
+
+This module provides a user-friendly interface for setting up and running
+optimization experiments with support for local and distributed workers
+using various transport protocols (IPC, TCP, HTTP).
+"""
+
 import logging
-import multiprocessing
-import os
-from pathlib import Path
-import sys
-import tempfile
-from typing import Any, Callable
+import multiprocessing as mp
+import signal
+import time
+from typing import Callable
 
-from hola.client.client import OptimizationClient
-from hola.core.coordinator import OptimizationCoordinator
-from hola.core.objectives import ObjectiveName, ObjectiveConfig
-from hola.core.parameters import ParameterName, ParameterConfig
-from hola.core.samplers import ClippedGaussianMixtureSampler, ExploreExploitSampler, SobolSampler
-from hola.server.config import ConnectionConfig, SocketType
-from hola.server.server import OptimizationServer
-from hola.worker.worker import OptimizationWorker
+from hola.core.coordinator import OptimizationCoordinator, OptimizationState
+from hola.network.scheduler import SchedulerProcess
+from hola.network.server import Server
+from hola.network.worker import LocalWorker
+from hola.utils.config import SystemConfig
+from hola.utils.logging import setup_logging
 
 
-def setup_logging(level=logging.INFO):
-    # Clear any existing handlers
-    root = logging.getLogger()
-    for handler in root.handlers[:]:
-        root.removeHandler(handler)
+class HOLA:
+    """
+    High-level interface for the hyperparameter optimization system.
 
-    # Configure root logger
-    logging.basicConfig(
-        level=level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[logging.StreamHandler(sys.stdout)]
-    )
+    This class provides a user-friendly way to set up and run optimization
+    experiments with support for:
+    - Local workers using IPC (fastest for same-machine communication)
+    - Local workers using TCP (useful for testing distributed setups)
+    - Remote workers using TCP (for distributed computing)
+    - Remote workers using HTTP(S) (for web-based or cloud deployments)
 
-    # Configure specific loggers
-    loggers = [
-        'hola.server.server',
-        'hola.worker.worker',
-        'hola.client.client',
-        'hola.core.coordinator',
-        'hola.local'
-    ]
+    Example usage:
+    ```python
+    def evaluation_fn(param1: float, param2: float) -> dict[str, float]:
+        return {"objective1": param1 + param2}
 
-    for logger_name in loggers:
-        logger = logging.getLogger(logger_name)
-        logger.setLevel(level)
-        # Ensure logger propagates to root
-        logger.propagate = True
+    coordinator = OptimizationCoordinator.from_dict(...)
+    config = SystemConfig(local_workers=4)
 
-logger = logging.getLogger(__name__)
+    with OptimizationSystem(coordinator, evaluation_fn, config) as system:
+        # System is running with workers
+        system.wait_until_complete()
 
-class LocalOptimizer:
+        # Get results
+        final_state = system.get_final_state()
+        print(f"Best result: {final_state.best_result}")
+    ```
+    """
 
     def __init__(
         self,
+        coordinator: OptimizationCoordinator,
         evaluation_fn: Callable[..., dict[str, float]],
-        objectives_config: dict[str, dict[str, Any]],
-        parameters_config: dict[str, dict[str, Any]],
-        n_workers: int = -1,
-        use_exploit: bool = True,
-        temp_dir: str | None = None,
-        log_level: int = logging.INFO
+        config: SystemConfig = SystemConfig(),
     ):
-        setup_logging(log_level)
+        """
+        Initialize the optimization system.
+
+        Args:
+            coordinator: The optimization coordinator instance
+            evaluation_fn: Function that evaluates parameters and returns objectives
+            config: System configuration
+        """
+        self.coordinator = coordinator
         self.evaluation_fn = evaluation_fn
-        self.objectives_config = objectives_config
-        self.parameters_config = parameters_config
-        self.n_workers = multiprocessing.cpu_count() if n_workers <= 0 else n_workers
-        self.use_exploit = use_exploit
-        self.temp_dir = temp_dir or tempfile.gettempdir()
+        self.config = config
 
-        # Components that will be initialized during optimization
-        self.server = None
-        self.workers: list[OptimizationWorker] = []
-        self.client = None
-        self.tasks: list[asyncio.Task] = []
+        self.logger = setup_logging("OptimizationSystem")
+        self.active_workers = mp.Value("i", 0)
 
-    def _create_sampler(self) -> SobolSampler | ExploreExploitSampler:
-        dimension = len(self.parameters_config)
+        # Initialize components
+        self._scheduler_process = None
+        self._local_workers = []
+        self._server = None
+        self._running = False
 
-        if not self.use_exploit:
-            return SobolSampler(dimension=dimension)
+        # Setup signal handlers
+        self._setup_signal_handlers()
 
-        explore_sampler = SobolSampler(dimension=dimension)
-        exploit_sampler = ClippedGaussianMixtureSampler(
-            dimension=dimension,
-            n_components=min(5, len(self.parameters_config))
+    def start(self):
+        """Start the optimization system."""
+        if self._running:
+            return
+
+        self.logger.info(
+            f"Starting optimization system:\n"
+            f"- Local workers: {self.config.local_workers} ({self.config.local_transport})\n"
+            f"- TCP endpoint: {self.config.network.tcp_host}:{self.config.network.tcp_port}\n"
+            f"- HTTP endpoint: {self.config.network.rest_host}:{self.config.network.rest_port}"
         )
 
-        return ExploreExploitSampler(
-            explore_sampler=explore_sampler,
-            exploit_sampler=exploit_sampler
+        # Start scheduler
+        self._scheduler_process = mp.Process(target=self._run_scheduler)
+        self._scheduler_process.start()
+
+        # Give scheduler time to initialize
+        time.sleep(0.5)
+
+        # Start REST API server
+        self._server = Server(
+            host=self.config.network.rest_host,
+            port=self.config.network.rest_port,
+            active_workers=self.active_workers,
         )
+        self._server.start()
 
-    async def _setup(self):
-        # Create unique IPC path
-        ipc_path = os.path.join(self.temp_dir, f"hola-local-{os.getpid()}")
-        config = ConnectionConfig(
-            socket_type=SocketType.IPC,
-            ipc_path=ipc_path
-        )
+        # Start local workers if configured
+        if self.config.local_workers > 0:
+            self._start_local_workers()
 
-        # Create and start server
-        sampler = self._create_sampler()
-        coordinator = OptimizationCoordinator.from_dict(
-            sampler,
-            self.objectives_config,
-            self.parameters_config
-        )
-        self.server = OptimizationServer(coordinator, config)
-        server_task = asyncio.create_task(self.server.start())
-        self.tasks.append(server_task)
+        self._running = True
+        self.logger.info("System started successfully")
 
-        # Give server time to start
-        await asyncio.sleep(0.1)
+    def stop(self):
+        """Stop the optimization system."""
+        if not self._running:
+            return
 
-        # Start workers
-        for _ in range(self.n_workers):
-            worker = OptimizationWorker(config, self.evaluation_fn)
-            worker_task = asyncio.create_task(worker.start())
-            self.tasks.append(worker_task)
-            self.workers.append(worker)
+        self.logger.info("Stopping optimization system...")
 
-        # Start client
-        self.client = OptimizationClient(config)
-        await self.client.start()
+        # Stop scheduler
+        if self._scheduler_process:
+            self._scheduler_process.terminate()
+            self._scheduler_process.join(timeout=2)
 
-        # Initialize optimization
-        await self.client.initialize(
-            objectives_config=self.objectives_config,
-            parameters_config=self.parameters_config
-        )
+        # Stop REST server
+        if self._server:
+            self._server.stop()
 
-    async def _cleanup(self):
-        cleanup_timeout = 5  # seconds
+        # Stop local workers
+        for p in self._local_workers:
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=1)
 
-        # Stop workers
-        for worker in self.workers:
-            await worker.stop()
+        self._running = False
+        self.logger.info("System stopped successfully")
 
-        # Stop client
-        if self.client:
-            await self.client.stop()
+    def wait_until_complete(self, timeout: float = None) -> bool:
+        """
+        Wait until all workers have completed.
 
-        # Cancel all tasks
-        for task in self.tasks:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        Args:
+            timeout: Maximum time to wait in seconds. None for no timeout.
 
-        # Clean up contexts
-        if self.server:
-            self.server.context.destroy(linger=0)
-        for worker in self.workers:
-            worker.context.destroy(linger=0)
-        if self.client:
-            self.client.context.destroy()
+        Returns:
+            True if completed normally, False if timed out.
+        """
+        start_time = time.time()
+        while self._running:
+            with self.active_workers.get_lock():
+                if self.active_workers.value <= 0:
+                    return True
 
-        # Clean up IPC files
-        ipc_path = os.path.join(self.temp_dir, f"hola-local-{os.getpid()}")
-        for suffix in ['-worker', '-client']:
-            try:
-                Path(ipc_path + suffix).unlink()
-            except FileNotFoundError:
-                pass
+            if timeout and (time.time() - start_time) > timeout:
+                return False
 
-    async def optimize(self, max_evaluations: int = 100, status_interval: float = 1.0):
-        try:
-            await self._setup()
+            time.sleep(0.1)
+        return True
 
-            while True:
-                status = await self.client.get_status()
-                if status.status.total_evaluations >= max_evaluations:
-                    break
+    def get_final_state(self) -> OptimizationState:
+        """Get the final optimization state."""
+        return self.coordinator.get_state()
 
-                await asyncio.sleep(status_interval)
+    def get_connection_info(self) -> dict[str, str]:
+        """
+        Get connection information for remote workers.
 
-            return status.status.best_result
+        Returns:
+            Dictionary containing connection endpoints for different protocols.
+        """
+        return {
+            "tcp": f"tcp://{self.config.network.tcp_host}:{self.config.network.tcp_port}",
+            "http": f"http{'s' if self.config.network.use_ssl else ''}://"
+            f"{self.config.network.rest_host}:{self.config.network.rest_port}",
+        }
 
-        finally:
-            await self._cleanup()
+    def _run_scheduler(self):
+        """Internal method to run the scheduler."""
+        scheduler = SchedulerProcess(self.coordinator)
+        scheduler.active_workers = self.active_workers
+        scheduler.run()
+
+    def _start_local_workers(self):
+        """Start local worker processes."""
+        for i in range(self.config.local_workers):
+            worker = LocalWorker(
+                worker_id=i,
+                active_workers=self.active_workers,
+                evaluation_fn=self.evaluation_fn,
+                transport=self.config.local_transport,
+                network_config=self.config.network,
+            )
+            p = mp.Process(target=worker.run)
+            p.start()
+            self._local_workers.append(p)
+
+    def _setup_signal_handlers(self):
+        """Setup graceful shutdown on signals."""
+
+        def signal_handler(signum, frame):
+            self.logger.info(f"Received signal {signum}")
+            self.stop()
+
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
+    def __enter__(self):
+        """Context manager entry."""
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
+        self.stop()
+
 
 def run_optimization(
+    coordinator: OptimizationCoordinator,
     evaluation_fn: Callable[..., dict[str, float]],
-    objectives_config: dict[str, dict[str, Any]],
-    parameters_config: dict[str, dict[str, Any]],
-    max_evaluations: int = 100,
-    n_workers: int = -1,
-    use_exploit: bool = True,
-    temp_dir: str | None = None,
-    status_interval: float = 1.0,
-    log_level: int = logging.INFO
-) -> Any:
-    optimizer = LocalOptimizer(
-        evaluation_fn=evaluation_fn,
-        objectives_config=objectives_config,
-        parameters_config=parameters_config,
-        n_workers=n_workers,
-        use_exploit=use_exploit,
-        temp_dir=temp_dir,
-        log_level=log_level
-    )
+    config: SystemConfig = SystemConfig(),
+    timeout: float = None,
+) -> OptimizationState:
+    """
+    Convenience function to run an optimization experiment.
 
-    return asyncio.run(optimizer.optimize(
-        max_evaluations=max_evaluations,
-        status_interval=status_interval
-    ))
+    Args:
+        coordinator: The optimization coordinator instance
+        evaluation_fn: Function that evaluates parameters and returns objectives
+        config: System configuration
+        timeout: Maximum time to run in seconds
+
+    Returns:
+        Final optimization state
+    """
+    with HOLA(coordinator, evaluation_fn, config) as system:
+        completed = system.wait_until_complete(timeout)
+        if not completed:
+            logging.warning("Optimization timed out")
+        return system.get_final_state()
