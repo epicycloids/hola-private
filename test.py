@@ -4,15 +4,17 @@ import sys
 import threading
 import time
 from datetime import datetime
-from typing import Any
+from multiprocessing.sharedctypes import Synchronized
+from typing import Any, Callable
 
 import msgspec
 import uvicorn
 import zmq
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from msgspec import Struct
 
 from hola.core.coordinator import OptimizationCoordinator
+from hola.core.leaderboard import Trial
 from hola.core.objectives import ObjectiveName
 from hola.core.parameters import ParameterName
 from hola.core.samplers import SobolSampler
@@ -22,7 +24,7 @@ from hola.core.samplers import SobolSampler
 # ============================================================================
 
 
-def setup_logging(name, level=logging.INFO):
+def setup_logging(name: str, level: int = logging.INFO) -> logging.Logger:
     """Configure logging for a component with console and file handlers."""
     logger = logging.getLogger(name)
     logger.setLevel(level)
@@ -75,6 +77,10 @@ class ShutdownRequest(Struct, tag="shutdown"):
     pass
 
 
+class StatusRequest(Struct, tag="status"):
+    pass
+
+
 # Response Messages
 class GetSuggestionResponse(Struct, tag="suggestion_response"):
     parameters: dict[ParameterName, Any] | None
@@ -85,13 +91,21 @@ class SubmitResultResponse(Struct, tag="result_response"):
     error: str | None = None
 
 
+class StatusResponse(Struct, tag="status_response"):
+    active_workers: int
+    total_evaluations: int
+    best_objectives: dict[ObjectiveName, float] | None = None
+
+
 # Define the message union type
 Message = (
     GetSuggestionRequest
     | SubmitResultRequest
     | ShutdownRequest
+    | StatusRequest
     | GetSuggestionResponse
     | SubmitResultResponse
+    | StatusResponse
 )
 
 
@@ -105,13 +119,15 @@ class SchedulerProcess:
 
     def __init__(self, coordinator: OptimizationCoordinator):
         self.coordinator = coordinator
-        self.running = False
-        self.active_workers = mp.Value("i", 0)  # Shared counter for active workers
+        self.running: bool = False
+        self.active_workers: Synchronized[int] = mp.Value(
+            "i", 0
+        )  # Shared counter for active workers
         self.logger = setup_logging("Scheduler")
 
     def run(self):
-        context = zmq.Context()
-        socket = context.socket(zmq.REP)
+        context: zmq.Context = zmq.Context()
+        socket: zmq.Socket = context.socket(zmq.REP)
         socket.setsockopt(zmq.LINGER, 0)  # Prevents hanging on context termination
 
         socket.bind("ipc:///tmp/scheduler.ipc")
@@ -141,6 +157,24 @@ class SchedulerProcess:
                         case ShutdownRequest():
                             self.running = False
                             socket.send(msgspec.json.encode(SubmitResultResponse(success=True)))
+
+                        case StatusRequest():
+                            try:
+                                state = self.coordinator.get_state()
+                                response = StatusResponse(
+                                    active_workers=self.active_workers.value,
+                                    total_evaluations=state.total_evaluations,
+                                    best_objectives=state.best_result.objectives if state.best_result else None
+                                )
+                                socket.send(msgspec.json.encode(response))
+                            except Exception as e:
+                                self.logger.error(f"Error creating status response: {e}")
+                                error_response = StatusResponse(
+                                    active_workers=self.active_workers.value,
+                                    total_evaluations=0,
+                                    best_objectives=None
+                                )
+                                socket.send(msgspec.json.encode(error_response))
 
             except Exception as e:
                 self.logger.error(f"Scheduler error: {e}")
@@ -181,8 +215,8 @@ class LocalWorker:
     def __init__(
         self,
         worker_id: int,
-        active_workers,
-        evaluation_fn: callable,  # New parameter
+        active_workers: Synchronized,
+        evaluation_fn: Callable[..., dict[ObjectiveName, float]],
         use_ipc: bool = True,
     ):
         self.worker_id = worker_id
@@ -295,47 +329,55 @@ class RESTSubmitResponse(msgspec.Struct):
 class Server:
     """HTTP server providing REST API access to the optimization system."""
 
-    def __init__(self, host="localhost", port=8000, active_workers=None):
+    def __init__(
+        self, host: str = "localhost", port: int = 8000, active_workers: Synchronized | None = None
+    ):
         self.host = host
         self.port = port
         self.active_workers = active_workers
 
-        self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.REQ)
+        self.context: zmq.Context = zmq.Context()
+        self.socket: zmq.Socket = self.context.socket(zmq.REQ)
         self.socket.connect("ipc:///tmp/scheduler.ipc")
 
         self.rest_app = FastAPI()
         self.setup_rest_routes()
 
-        self.running = False
+        self.running: bool = False
         self.logger = setup_logging("Server")
 
-    def setup_rest_routes(self):
-        @self.rest_app.get("/suggestion", response_model=RESTGetSuggestionResponse)
-        async def get_job():
+    def setup_rest_routes(self) -> None:
+        @self.rest_app.get("/suggestion", response_model=None)
+        async def get_job() -> bytes:
             try:
-                request = GetSuggestionRequest(worker_id=-1)  # Use -1 for REST API requests
+                request = GetSuggestionRequest(worker_id=-1)
                 self.socket.send(msgspec.json.encode(request))
 
                 response = msgspec.json.decode(self.socket.recv(), type=Message)
                 match response:
                     case GetSuggestionResponse(parameters=params):
-                        return RESTGetSuggestionResponse(parameters=params)
+                        return msgspec.json.encode(RESTGetSuggestionResponse(parameters=params))
                     case _:
-                        return RESTGetSuggestionResponse(
-                            parameters=None, error="Unexpected response from scheduler"
+                        return msgspec.json.encode(
+                            RESTGetSuggestionResponse(
+                                parameters=None, error="Unexpected response from scheduler"
+                            )
                         )
 
             except Exception as e:
-                return RESTGetSuggestionResponse(
-                    parameters=None, error=f"Error getting job: {str(e)}"
+                return msgspec.json.encode(
+                    RESTGetSuggestionResponse(parameters=None, error=f"Error getting job: {str(e)}")
                 )
 
-        @self.rest_app.post("/result", response_model=RESTSubmitResponse)
-        async def submit_result(result: RESTSubmitResult):
+        @self.rest_app.post("/suggestion", response_model=None)
+        async def submit_result(request: Request) -> bytes:  # Use FastAPI's Request
             try:
+                # Decode the raw request body using msgspec
+                body = await request.body()
+                result = msgspec.json.decode(body, type=RESTSubmitResult)
+
                 request = SubmitResultRequest(
-                    worker_id=-1,  # Use -1 for REST API requests
+                    worker_id=-1,
                     result=Result(parameters=result.parameters, objectives=result.objectives),
                 )
                 self.socket.send(msgspec.json.encode(request))
@@ -343,14 +385,51 @@ class Server:
                 response = msgspec.json.decode(self.socket.recv(), type=Message)
                 match response:
                     case SubmitResultResponse(success=success, error=error):
-                        return RESTSubmitResponse(success=success, error=error)
+                        return msgspec.json.encode(RESTSubmitResponse(success=success, error=error))
                     case _:
-                        return RESTSubmitResponse(
-                            success=False, error="Unexpected response from scheduler"
+                        return msgspec.json.encode(
+                            RESTSubmitResponse(
+                                success=False, error="Unexpected response from scheduler"
+                            )
                         )
 
             except Exception as e:
-                return RESTSubmitResponse(success=False, error=f"Error submitting result: {str(e)}")
+                return msgspec.json.encode(
+                    RESTSubmitResponse(success=False, error=f"Error submitting result: {str(e)}")
+                )
+
+        @self.rest_app.get("/status")
+        async def get_status():
+            try:
+                self.logger.info("Received status request")
+
+                request = StatusRequest()
+                encoded_request = msgspec.json.encode(request)
+                self.logger.info(f"Sending request to scheduler: {encoded_request}")
+
+                self.socket.send(encoded_request)
+
+                raw_response = self.socket.recv()
+                self.logger.info(f"Received raw response from scheduler: {raw_response}")
+
+                response = msgspec.json.decode(raw_response, type=Message)
+                self.logger.info(f"Decoded response: {response}")
+
+                match response:
+                    case StatusResponse() as status:
+                        return {
+                            "active_workers": status.active_workers,
+                            "total_evaluations": status.total_evaluations,
+                            "best_result": {
+                                "objectives": status.best_objectives
+                            } if status.best_objectives else None
+                        }
+                    case _:
+                        return {"error": "Unexpected response type"}
+
+            except Exception as e:
+                self.logger.error(f"Error handling status request: {e}")
+                return {"error": str(e)}
 
     def start(self):
         self.running = True
@@ -377,14 +456,17 @@ class Server:
 
 
 def spawn_local_worker(
-    worker_id: int, active_workers, evaluation_fn: callable, use_ipc: bool = True
+    worker_id: int,
+    active_workers: Synchronized,
+    evaluation_fn: Callable[..., dict[ObjectiveName, str]],
+    use_ipc: bool = True,
 ):
     """Spawn a new worker process."""
     worker = LocalWorker(worker_id, active_workers, evaluation_fn, use_ipc)
     worker.run()
 
 
-def shutdown_system(scheduler_process, server, active_workers):
+def shutdown_system(scheduler_process: mp.Process, server: Server, active_workers: Synchronized):
     """Gracefully shutdown all system components."""
     logger = setup_logging("Shutdown")
     logger.info("Initiating shutdown...")
@@ -395,9 +477,21 @@ def shutdown_system(scheduler_process, server, active_workers):
     socket.connect("ipc:///tmp/scheduler.ipc")
 
     try:
-        socket.send_multipart([Message.SHUTDOWN])
+        # Use the proper ShutdownRequest message type
+        shutdown_request = ShutdownRequest()
+        socket.send(msgspec.json.encode(shutdown_request))
+
+        # Wait for response with timeout
         if socket.poll(1000, zmq.POLLIN):
-            socket.recv_pyobj()
+            response = msgspec.json.decode(socket.recv(), type=Message)
+            match response:
+                case SubmitResultResponse(success=True):
+                    logger.info("Scheduler acknowledged shutdown request")
+                case _:
+                    logger.warning("Unexpected response to shutdown request")
+        else:
+            logger.warning("No response received from scheduler during shutdown")
+
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
     finally:
@@ -425,7 +519,7 @@ if __name__ == "__main__":
 
     # Create and configure OptimizationCoordinator
     hypercube_sampler = SobolSampler(dimension=2)
-    objectives_dict = {"objective1": {"direction": "minimize", "target": 0.2, "limit": 0.9}}
+    objectives_dict = {"objective1": {"direction": "minimize", "target": 1e-6, "limit": 0.9}}
     parameters_dict = {
         "param1": {"type": "continuous", "min": 0.0, "max": 1.0},
         "param2": {"type": "continuous", "min": 0.0, "max": 1.0},
@@ -455,8 +549,8 @@ if __name__ == "__main__":
     server.start()
 
     # Start workers
-    processes = []
-    num_workers = 4
+    processes: list[mp.Process] = []
+    num_workers = 16
     for i in range(num_workers):
         use_ipc = i < num_workers // 2
         p = mp.Process(
