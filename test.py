@@ -14,7 +14,6 @@ from fastapi import FastAPI, Request
 from msgspec import Struct
 
 from hola.core.coordinator import OptimizationCoordinator
-from hola.core.leaderboard import Trial
 from hola.core.objectives import ObjectiveName
 from hola.core.parameters import ParameterName
 from hola.core.samplers import SobolSampler

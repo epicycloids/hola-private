@@ -1,17 +1,22 @@
+"""Scheduler process for coordinating optimization trials."""
+
 import multiprocessing as mp
+from multiprocessing.sharedctypes import Synchronized
 from typing import Any
 
 import msgspec
 import zmq
 
 from hola.core.coordinator import OptimizationCoordinator
+from hola.core.leaderboard import Trial
 from hola.core.parameters import ParameterName
-from hola.messages.base import Result
-from hola.messages.scheduler import (
+from hola.messages.protocol import (
     GetSuggestionRequest,
     GetSuggestionResponse,
     Message,
     ShutdownRequest,
+    StatusRequest,
+    StatusResponse,
     SubmitResultRequest,
     SubmitResultResponse,
 )
@@ -23,13 +28,13 @@ class SchedulerProcess:
 
     def __init__(self, coordinator: OptimizationCoordinator):
         self.coordinator = coordinator
-        self.running = False
-        self.active_workers = mp.Value("i", 0)  # Shared counter for active workers
+        self.running: bool = False
+        self.active_workers: Synchronized[int] = mp.Value("i", 0)  # Shared counter for active workers
         self.logger = setup_logging("Scheduler")
 
     def run(self):
-        context = zmq.Context()
-        socket = context.socket(zmq.REP)
+        context: zmq.Context = zmq.Context()
+        socket: zmq.Socket = context.socket(zmq.REP)
         socket.setsockopt(zmq.LINGER, 0)  # Prevents hanging on context termination
 
         socket.bind("ipc:///tmp/scheduler.ipc")
@@ -60,6 +65,24 @@ class SchedulerProcess:
                             self.running = False
                             socket.send(msgspec.json.encode(SubmitResultResponse(success=True)))
 
+                        case StatusRequest():
+                            try:
+                                state = self.coordinator.get_state()
+                                response = StatusResponse(
+                                    active_workers=self.active_workers.value,
+                                    total_evaluations=state.total_evaluations,
+                                    best_objectives=state.best_result.objectives if state.best_result else None
+                                )
+                                socket.send(msgspec.json.encode(response))
+                            except Exception as e:
+                                self.logger.error(f"Error creating status response: {e}")
+                                error_response = StatusResponse(
+                                    active_workers=self.active_workers.value,
+                                    total_evaluations=0,
+                                    best_objectives=None
+                                )
+                                socket.send(msgspec.json.encode(error_response))
+
             except Exception as e:
                 self.logger.error(f"Scheduler error: {e}")
                 try:
@@ -78,7 +101,7 @@ class SchedulerProcess:
             return None
         return suggestions[0]
 
-    def register_completed(self, result: Result):
+    def register_completed(self, result: Trial):
         self.coordinator.record_evaluation(result.parameters, result.objectives)
         state = self.coordinator.get_state()
         self.logger.info(

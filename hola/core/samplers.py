@@ -180,8 +180,10 @@ class ClippedGaussianMixtureSampler:
     hypercube.
 
     This sampler fits a GMM to observed samples and generates new samples by:
-    1. Selecting a mixture component 2. Sampling from the chosen Gaussian 3.
-    Clipping the samples to [0,1]^d
+
+    1. Selecting a mixture component
+    2. Sampling from the chosen Gaussian
+    3. Clipping the samples to [0,1]^d
     """
 
     def __init__(
@@ -189,7 +191,7 @@ class ClippedGaussianMixtureSampler:
         dimension: int,
         n_components: int,
         reg_covar: float = 1e-6,
-        hypercube_sampler: HypercubeSampler | None = None,
+        hypercube_sampler: HypercubeSampler | None = None,  # TODO: add a static HypercubeSampler protocol
     ):
         """
         Initialize the GMM sampler.

@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""
+Command-line entry point for starting the HOLA monitoring dashboard.
+"""
+
+import argparse
+import webbrowser
+from threading import Timer
+
+from dash import Dash, dcc, html
+from dash.dependencies import Input, Output
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objs as go
+import requests
+
+from hola.messages.protocol import Result
+from hola.utils.logging import setup_logging
+
+
+def open_browser(port):
+    webbrowser.open_new(f"http://localhost:{port}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Start HOLA monitoring dashboard")
+    parser.add_argument("--server-url", default="http://localhost:8000",
+                        help="URL of the HOLA server")
+    parser.add_argument("--port", type=int, default=8050,
+                        help="Port to run the dashboard on")
+    parser.add_argument("--no-browser", action="store_true",
+                        help="Don't open browser automatically")
+    args = parser.parse_args()
+
+    # Setup logging
+    logger = setup_logging("HOLAMonitor")
+
+    app = Dash(__name__)
+
+    app.layout = html.Div([
+        html.H1("HOLA Optimization Monitor"),
+        html.Div([
+            html.Button('Refresh', id='refresh-button', n_clicks=0),
+            dcc.Interval(
+                id='interval-component',
+                interval=5*1000,  # in milliseconds (5 seconds)
+                n_intervals=0
+            ),
+        ]),
+        html.Div(id='status-display', style={'margin': '20px 0'}),
+        dcc.Graph(id='results-scatter'),
+        dcc.Graph(id='convergence-plot')
+    ])
+
+    @app.callback(
+        [Output('status-display', 'children'),
+         Output('results-scatter', 'figure'),
+         Output('convergence-plot', 'figure')],
+        [Input('interval-component', 'n_intervals'),
+         Input('refresh-button', 'n_clicks')]
+    )
+    def update_graphs(n_intervals, n_clicks):
+        try:
+            response = requests.get(f"{args.server_url}/status")
+            status = response.json()
+            logger.info(f"Retrieved status from server: {len(status['results'])} results")
+
+            if not status['results']:
+                return (
+                    html.Div([
+                        html.H3("Server Status"),
+                        html.P(f"Connected to: {args.server_url}"),
+                        html.P(f"Active Workers: {status['active_workers']}"),
+                        html.P("No results available yet.")
+                    ]),
+                    go.Figure(),
+                    go.Figure()
+                )
+
+            # Create a DataFrame from results
+            results = [Result.from_dict(r) for r in status['results']]
+            data = []
+            for i, result in enumerate(results):
+                data.append({
+                    'id': i,
+                    'evaluations': result.evaluations,
+                    **{f'param{j}': v for j, v in enumerate(result.parameters)},
+                    **{f'objective{j}': v for j, v in enumerate(result.objectives)}
+                })
+            df = pd.DataFrame(data)
+
+            # Create scatter plot
+            scatter_fig = px.scatter(
+                df,
+                x='param0',
+                y='param1' if 'param1' in df.columns else 'objective0',
+                color='objective0',
+                hover_data=['id', 'evaluations'] +
+                           [c for c in df.columns if c.startswith('param') or c.startswith('objective')]
+            )
+            scatter_fig.update_layout(title='Parameter Space Exploration')
+
+            # Create convergence plot
+            df_sorted = df.sort_values('evaluations')
+            convergence_fig = px.line(
+                df_sorted,
+                x='evaluations',
+                y='objective0',
+                title='Optimization Convergence'
+            )
+
+            # If objective is being minimized, add min cumulative line
+            df_sorted['min_so_far'] = df_sorted['objective0'].cummin()
+            convergence_fig.add_scatter(
+                x=df_sorted['evaluations'],
+                y=df_sorted['min_so_far'],
+                mode='lines',
+                name='Best So Far'
+            )
+
+            status_display = html.Div([
+                html.H3("Server Status"),
+                html.P(f"Connected to: {args.server_url}"),
+                html.P(f"Active Workers: {status['active_workers']}"),
+                html.P(f"Total Evaluations: {status['total_evaluations']}"),
+                html.P(f"Best Value: {status['best_value']:.6f}" if status['best_value'] is not None else "No best value yet"),
+                html.P(f"Best Parameters: {', '.join([f'{p:.4f}' for p in status['best_parameters']])}"
+                       if status['best_parameters'] else "None")
+            ])
+
+            return status_display, scatter_fig, convergence_fig
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error connecting to server: {e}")
+            return (
+                html.Div([
+                    html.H3("Server Connection Error"),
+                    html.P(f"Could not connect to {args.server_url}"),
+                    html.P(str(e))
+                ]),
+                go.Figure(),
+                go.Figure()
+            )
+
+    # Auto-open browser
+    if not args.no_browser:
+        Timer(1, open_browser, [args.port]).start()
+
+    logger.info(f"Starting dashboard on port {args.port}")
+    print(f"Starting HOLA monitor on http://localhost:{args.port}")
+    app.run_server(debug=False, port=args.port)
+
+
+if __name__ == "__main__":
+    main()

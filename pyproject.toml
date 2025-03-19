@@ -38,6 +38,9 @@ streamlit = "^1.41.1"
 pygmo = "^2.19.5"
 thespian = "^4.0.0"
 fastapi-msgspec = "^0.1.0"
+streamlit-autorefresh = "^1.0.1"
+dash = "^3.0.0"
+jaxtyping = "^0.3.0"
 
 
 [tool.poetry.group.dev.dependencies]
