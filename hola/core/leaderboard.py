@@ -12,20 +12,19 @@ and maintains their partial ordering based on objective comparison groups. Key f
 5. Provides methods for retrieving best trials and trial statistics
 6. Handles updates to objective scoring and parameter feasibility criteria
 
-Trials are categorized into three types:
-1. Feasible trials with all finite-value scores (ranked in poset)
-2. Feasible trials with at least one infinite-value score (stored but not ranked)
-3. Infeasible trials (stored but not counted in total length)
+Trials can be:
+- Feasible with all finite scores (ranked in the poset)
+- Feasible with at least one infinite score (stored but not ranked)
+- Infeasible (stored but not included in ranking)
 """
 
 from typing import Any, Dict, List, Optional, Union
 
-import msgspec
 import pandas as pd
 from msgspec import Struct
 
 from hola.core.objectives import ObjectiveName, ObjectiveScorer
-from hola.core.parameters import ParameterName, ParameterTransformer
+from hola.core.parameters import ParameterName
 from hola.core.poset import ScalarPoset, VectorPoset
 
 
@@ -84,8 +83,8 @@ class Leaderboard:
         Get the count of all feasible trials, including those with infinite scores.
 
         This includes both:
-        - Category 1: Feasible trials with all finite scores (ranked in poset)
-        - Category 2: Feasible trials with at least one infinite score (not ranked)
+        - Feasible trials with all finite scores (ranked in poset)
+        - Feasible trials with at least one infinite score (not ranked)
 
         :return: Number of feasible trials in the leaderboard
         :rtype: int
@@ -96,8 +95,8 @@ class Leaderboard:
         """
         Get the count of feasible trials with at least one infinite score.
 
-        This counts only Category 2 trials: feasible but with at least one
-        infinite score, which are not ranked in the poset.
+        These trials are stored in the leaderboard but not ranked in the poset
+        due to having at least one infinite objective score.
 
         :return: Number of feasible trials with infinite scores
         :rtype: int
@@ -111,7 +110,7 @@ class Leaderboard:
         """
         Get the count of infeasible trials.
 
-        This counts only Category 3 trials: those marked as infeasible.
+        These are trials where parameter values violated feasibility constraints.
 
         :return: Number of infeasible trials
         :rtype: int
@@ -122,10 +121,10 @@ class Leaderboard:
         """
         Get the total count of all trials in the leaderboard.
 
-        This includes all three categories:
-        1. Feasible trials with all finite scores (ranked in poset)
-        2. Feasible trials with at least one infinite score (not ranked)
-        3. Infeasible trials
+        This includes:
+        - Feasible trials with all finite scores (ranked in poset)
+        - Feasible trials with at least one infinite score (not ranked)
+        - Infeasible trials
 
         :return: Total number of trials stored in the leaderboard
         :rtype: int
@@ -136,7 +135,8 @@ class Leaderboard:
         """
         Get the number of trials in the leaderboard's partial ordering.
 
-        Note: This only counts feasible trials with all finite scores (category 1).
+        This only counts feasible trials with all finite scores that are
+        included in the partial ordering (poset).
 
         :return: Number of ranked trials
         :rtype: int
@@ -186,90 +186,89 @@ class Leaderboard:
         """
         return [self._data[idx] for idx, _ in self._poset.peek(k)]
 
-    def get_dataframe(self) -> pd.DataFrame:
+    def get_top_k_fronts(self, k: int = 1) -> list[list[Trial]]:
         """
-        Convert leaderboard to a DataFrame of ranked trials.
+        Get the top k Pareto fronts of trials.
 
-        Creates a DataFrame containing information about trials with finite scores,
-        ordered by non-dominated sorting and crowding distance. The
-        DataFrame includes:
+        In multi-objective optimization with multiple comparison groups, trials are
+        organized into Pareto fronts based on dominance relationships between group scores.
+        The first front contains non-dominated trials, the second front contains
+        trials dominated only by those in the first front, and so on.
+
+        This method returns complete fronts (not just individual trials), preserving
+        the Pareto dominance relationships. Within each front, trials are ordered
+        by crowding distance to promote diversity.
+
+        :param k: Number of fronts to return
+        :type k: int
+        :return: List of up to k fronts, each containing a list of Trial objects
+        :rtype: list[list[Trial]]
+        :raises ValueError: If k < 1
+        """
+        if k < 1:
+            raise ValueError("k must be positive.")
+
+        result = []
+        # Take the first k fronts from the poset
+        for i, front in enumerate(self._poset.fronts()):
+            if i >= k:
+                break
+
+            # Convert each front from (id, score) tuples to Trial objects
+            trial_front = [self._data[trial_id] for trial_id, _ in front]
+            result.append(trial_front)
+
+        return result
+
+    def get_dataframe(self, ranked_only: bool = True) -> pd.DataFrame:
+        """
+        Convert leaderboard trials to a DataFrame.
+
+        Creates a DataFrame containing information about trials, including:
         - Trial IDs
         - Parameter values
         - Objective values
-        - Comparison group scores
-        - Crowding distance (provides diversity measure within a Pareto front)
+        - Comparison group scores (for ranked trials)
+        - Crowding distance (for ranked trials)
 
-        Note:
-        - Only trials with finite scores are included in the DataFrame
-        - Trials are ordered first by their non-dominated front membership
-        - Within each front, trials are ordered by crowding distance to
-          promote diversity in parameter choices
-        - The ordering ensures best trials (according to comparison group
-          scores) appear in the top rows
-        - For trials with infinite scores, use the get_metadata() method
-
-        :return: DataFrame containing ranked trial information, sorted by ranking
+        :param ranked_only: If True, only include ranked trials (feasible with finite scores).
+                           If False, include all trials with status columns.
+        :type ranked_only: bool
+        :return: DataFrame containing trial information
         :rtype: pd.DataFrame
         """
         data_rows = []
-        for i, (key, score) in enumerate(self._poset.items()):
-            trial = self.get_trial(key)
 
-            # Get crowding distance from the poset
-            crowding_distance = self._poset.get_crowding_distance(key)
+        # Determine which trials to process
+        if ranked_only:
+            trial_ids = [key for key, _ in self._poset.items()]
+        else:
+            trial_ids = list(self._data.keys())
 
-            # Handle score properly based on its type
-            score_dict = {}
-            if self._objective_scorer.is_multigroup:
-                score_dict = {f"Group {j} Score": score[j] for j in range(len(score))}
-            else:
-                # If score is a single value (e.g., float)
-                score_dict = {"Group Score": score}
-
-            # Create a row with all information
-            row_data = {
-                "Trial": key,
-                "Crowding Distance": crowding_distance,
-                **{str(k): v for k, v in trial.parameters.items()},
-                **{str(k): v for k, v in trial.objectives.items()},
-                **score_dict,
-            }
-            data_rows.append(row_data)
-
-        # Create DataFrame from the list of dictionaries
-        if not data_rows:
-            # Return empty DataFrame with expected columns if no data
-            return pd.DataFrame(columns=["Trial", "Crowding Distance"])
-
-        return pd.DataFrame(data_rows)
-
-    def get_all_trials_dataframe(self) -> pd.DataFrame:
-        """
-        Convert all trials in the leaderboard to a DataFrame, including those with infinite scores.
-
-        Unlike get_dataframe(), this method includes ALL trials, even those with infinite scores
-        that aren't ranked in the partial ordering.
-
-        :return: DataFrame containing all trial information
-        :rtype: pd.DataFrame
-        """
-        data_rows = []
-        for tid, trial in self._data.items():
-            # Check if this trial is in the poset (has finite scores)
+        # Process each trial
+        for tid in trial_ids:
+            trial = self._data[tid]
             is_ranked = tid in self._poset.get_indices()
 
-            # Create a row with basic trial information
+            # Skip unranked trials if ranked_only is True
+            if ranked_only and not is_ranked:
+                continue
+
+            # Basic information for all trials
             row_data = {
                 "Trial": tid,
-                "Is Ranked": is_ranked,
-                "Is Feasible": trial.is_feasible,
                 **{str(k): v for k, v in trial.parameters.items()},
                 **{str(k): v for k, v in trial.objectives.items()},
             }
 
-            # Add scores for ranked trials
+            # Add status columns for all trials mode
+            if not ranked_only:
+                row_data["Is Ranked"] = is_ranked
+                row_data["Is Feasible"] = trial.is_feasible
+
+            # Add score information for ranked trials
             if is_ranked:
-                score = self._poset[tid]  # Use __getitem__ instead of get_score
+                score = self._poset[tid]
                 crowding_distance = self._poset.get_crowding_distance(tid)
                 row_data["Crowding Distance"] = crowding_distance
 
@@ -281,11 +280,28 @@ class Leaderboard:
 
             data_rows.append(row_data)
 
-        # Create DataFrame from the list of dictionaries
+        # Create and return DataFrame
         if not data_rows:
-            return pd.DataFrame(columns=["Trial", "Is Ranked", "Is Feasible"])
+            # Return empty DataFrame with appropriate columns
+            columns = ["Trial"]
+            if not ranked_only:
+                columns.extend(["Is Ranked", "Is Feasible"])
+            if ranked_only or any(row.get("Crowding Distance") is not None for row in data_rows):
+                columns.append("Crowding Distance")
+            return pd.DataFrame(columns=columns)
 
         return pd.DataFrame(data_rows)
+
+    def get_all_trials_dataframe(self) -> pd.DataFrame:
+        """
+        Convert all trials in the leaderboard to a DataFrame, including those with infinite scores.
+
+        This is a convenience wrapper around get_dataframe(ranked_only=False).
+
+        :return: DataFrame containing all trial information
+        :rtype: pd.DataFrame
+        """
+        return self.get_dataframe(ranked_only=False)
 
     def get_metadata(self, trial_ids: Optional[Union[int, List[int]]] = None) -> pd.DataFrame:
         """
@@ -345,10 +361,11 @@ class Leaderboard:
         """
         Add a new trial to the leaderboard.
 
-        Trials are categorized as follows:
-        1. Feasible trials with all finite scores are added to the partial ordering
-        2. Feasible trials with infinite scores are stored but not ranked
-        3. Infeasible trials are stored but not counted in total length
+        All trials are stored in the data dictionary, but only feasible trials
+        with all finite scores are added to the partial ordering for ranking.
+
+        Trials with infinite scores or that violate feasibility constraints
+        are stored but not ranked.
 
         :param trial: Trial to add
         :type trial: Trial

@@ -15,8 +15,9 @@ promising regions of the parameter space.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
+import pandas as pd
 
 from hola.core.leaderboard import Leaderboard, Trial
 from hola.core.objectives import ObjectiveName, ObjectiveScorer
@@ -187,6 +188,123 @@ class OptimizationCoordinator:
         """
         return self.leaderboard.get_best_trial()
 
+    def get_top_k_trials(self, k: int = 1) -> list[Trial]:
+        """
+        Get the k best trials from the optimization process.
+
+        Returns k trials ordered by:
+        1. Non-dominated front membership
+        2. Crowding distance within each front (to promote diversity)
+
+        :param k: Number of trials to return
+        :type k: int
+        :return: List of up to k best trials
+        :rtype: list[Trial]
+        """
+        return self.leaderboard.get_top_k(k)
+
+    def get_top_k_fronts(self, k: int = 1) -> list[list[Trial]]:
+        """
+        Get the top k Pareto fronts of trials.
+
+        In multi-group optimization, trials are organized into Pareto fronts based on
+        dominance relationships between comparison groups. The first front contains
+        non-dominated trials, the second front contains trials dominated only by those
+        in the first front, and so on.
+
+        Note: This method is primarily useful when multiple comparison groups are used.
+        For single-group optimization, each front will contain trials with identical scores.
+
+        :param k: Number of fronts to return
+        :type k: int
+        :return: List of up to k fronts, each containing a list of Trial objects
+        :rtype: list[list[Trial]]
+        """
+        return self.leaderboard.get_top_k_fronts(k)
+
+    def get_trials_dataframe(self, ranked_only: bool = True) -> pd.DataFrame:
+        """
+        Get a DataFrame of trials from the optimization process.
+
+        :param ranked_only: If True, only include ranked trials (feasible with finite scores).
+                           If False, include all trials with status columns.
+        :type ranked_only: bool
+        :return: DataFrame containing trial information
+        :rtype: pd.DataFrame
+        """
+        return self.leaderboard.get_dataframe(ranked_only)
+
+    def get_all_trials_dataframe(self) -> pd.DataFrame:
+        """
+        Get a DataFrame of all trials from the optimization process.
+
+        This is a convenience wrapper around get_trials_dataframe(ranked_only=False).
+
+        :return: DataFrame containing all trial information
+        :rtype: pd.DataFrame
+        """
+        return self.leaderboard.get_all_trials_dataframe()
+
+    def get_trials_metadata(self, trial_ids: Optional[Union[int, List[int]]] = None) -> pd.DataFrame:
+        """
+        Get metadata for one or more trials as a DataFrame.
+
+        :param trial_ids: Specific trial ID(s) to retrieve metadata for, or None for all trials
+        :type trial_ids: Optional[Union[int, List[int]]]
+        :return: DataFrame with trial IDs as index and metadata as columns
+        :rtype: pd.DataFrame
+        """
+        return self.leaderboard.get_metadata(trial_ids)
+
+    def get_feasible_count(self) -> int:
+        """
+        Get the count of all feasible trials, including those with infinite scores.
+
+        :return: Number of feasible trials
+        :rtype: int
+        """
+        return self.leaderboard.get_feasible_count()
+
+    def get_feasible_infinite_count(self) -> int:
+        """
+        Get the count of feasible trials with at least one infinite objective score.
+
+        :return: Number of feasible trials with infinite scores
+        :rtype: int
+        """
+        return self.leaderboard.get_feasible_infinite_count()
+
+    def get_infeasible_count(self) -> int:
+        """
+        Get the count of infeasible trials.
+
+        :return: Number of infeasible trials
+        :rtype: int
+        """
+        return self.leaderboard.get_infeasible_count()
+
+    def get_ranked_count(self) -> int:
+        """
+        Get the number of ranked trials (feasible with all finite scores).
+
+        :return: Number of ranked trials
+        :rtype: int
+        """
+        return self.leaderboard.get_ranked_count()
+
+    def is_multi_group(self) -> bool:
+        """
+        Check if this is a multi-objective optimization using multiple comparison groups.
+
+        With multiple comparison groups, Pareto dominance sorting is used
+        to rank trials. With a single comparison group, trials are simply ranked by
+        their scalar score.
+
+        :return: True if using multiple objective comparison groups, False if using a single group
+        :rtype: bool
+        """
+        return self.leaderboard._objective_scorer.is_multigroup
+
 
 if __name__ == "__main__":
     from hola.core.coordinator import OptimizationCoordinator
@@ -296,26 +414,26 @@ if __name__ == "__main__":
 
     # Count trials in different data structures
     print(f"Trials in leaderboard._data: {len(coordinator.leaderboard._data)}")
-    print(f"Trials in leaderboard._poset (ranked trials): {coordinator.leaderboard.get_ranked_count()}")
-    print(f"Total trials: {coordinator.leaderboard.get_total_count()}")
-    print(f"Feasible trials: {coordinator.leaderboard.get_feasible_count()}")
-    print(f"Feasible with infinite scores: {coordinator.leaderboard.get_feasible_infinite_count()}")
-    print(f"Infeasible trials: {coordinator.leaderboard.get_infeasible_count()}")
+    print(f"Trials in leaderboard._poset (ranked trials): {coordinator.get_ranked_count()}")
+    print(f"Total trials: {coordinator.get_total_evaluations()}")
+    print(f"Feasible trials: {coordinator.get_feasible_count()}")
+    print(f"Feasible with infinite scores: {coordinator.get_feasible_infinite_count()}")
+    print(f"Infeasible trials: {coordinator.get_infeasible_count()}")
 
     # Get and display ranked trial information
-    trial_df = coordinator.leaderboard.get_dataframe()
+    trial_df = coordinator.get_trials_dataframe()
     print(f"\nRanked Trials DataFrame has {len(trial_df)} rows")
     print(trial_df.head())
 
     # Get and display ALL trials including those with infinite scores
-    all_trials_df = coordinator.leaderboard.get_all_trials_dataframe()
+    all_trials_df = coordinator.get_all_trials_dataframe()
     print(f"\nAll Trials DataFrame has {len(all_trials_df)} rows")
     print(f"- Ranked trials: {len(all_trials_df[all_trials_df['Is Ranked']])}")
     print(f"- Unranked trials: {len(all_trials_df[~all_trials_df['Is Ranked']])}")
     print(all_trials_df.head())
 
     # Get and display metadata separately
-    metadata_df = coordinator.leaderboard.get_metadata()
+    metadata_df = coordinator.get_trials_metadata()
     print(f"\nMetadata DataFrame has {len(metadata_df)} rows")
 
     # Verify metadata is present for both ranked and unranked trials
@@ -328,3 +446,18 @@ if __name__ == "__main__":
     print("\nSample metadata for unranked trial with infinite scores:")
     if len(unranked_metadata) > 0:
         print(unranked_metadata.head(1))
+
+    # Display top 3 trials
+    top_trials = coordinator.get_top_k_trials(3)
+    print("\nTop 3 Trials:")
+    for i, trial in enumerate(top_trials):
+        print(f"{i+1}. Trial {trial.trial_id}: {trial.objectives}")
+
+    # Display top 2 Pareto fronts (for multi-group optimization)
+    if coordinator.is_multi_group():
+        top_fronts = coordinator.get_top_k_fronts(2)
+        print("\nTop 2 Pareto Fronts:")
+        for i, front in enumerate(top_fronts):
+            print(f"Front {i+1} with {len(front)} trials:")
+            for trial in front:
+                print(f"  Trial {trial.trial_id}: {trial.objectives}")

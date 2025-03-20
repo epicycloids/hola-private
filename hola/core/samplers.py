@@ -10,7 +10,6 @@ The samplers follow a common interface defined by the HypercubeSampler
 protocol, allowing them to be used interchangeably in the optimization process.
 """
 
-import logging
 from typing import Protocol, TypeAlias, Union, Dict, Any, Tuple
 
 import numpy as np
@@ -20,8 +19,6 @@ from scipy.stats.qmc import Sobol
 from sklearn.mixture import GaussianMixture
 
 from hola.core.utils import uniform_to_category
-
-logger = logging.getLogger(__name__)
 
 
 class HypercubeSampler(Protocol):
@@ -414,7 +411,8 @@ class ExploreExploitSampler:
             self._exploit_sampler.fit(samples)
             self._is_fitted = True
         except (ValueError, np.linalg.LinAlgError) as e:
-            logger.warning(f"Failed to fit exploit sampler: {str(e)}")
+            # Warn the user
+            print(f"Failed to fit exploit sampler: {str(e)}")
             self._is_fitted = False
 
     def reset(self) -> None:
