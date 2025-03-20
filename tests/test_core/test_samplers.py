@@ -33,9 +33,10 @@ class TestUniformSampler:
 
     def test_sample(self):
         sampler = UniformSampler(dimension=3)
-        samples = sampler.sample(n_samples=5)
+        samples, metadata = sampler.sample(n_samples=5)
         assert samples.shape == (5, 3)
         assert np.all((samples >= 0) & (samples <= 1))
+        assert metadata["sampler_type"] == "uniform"
 
         with pytest.raises(ValueError, match="must be positive"):
             sampler.sample(n_samples=0)
@@ -61,19 +62,20 @@ class TestSobolSampler:
 
     def test_sample(self):
         sampler = SobolSampler(dimension=2)
-        samples = sampler.sample(n_samples=4)
+        samples, metadata = sampler.sample(n_samples=4)
         assert samples.shape == (4, 2)
         assert np.all((samples >= 0) & (samples <= 1))
+        assert metadata["sampler_type"] == "quasi-random"
 
         with pytest.raises(ValueError, match="must be positive"):
             sampler.sample(0)
 
     def test_reset(self):
         sampler = SobolSampler(dimension=2)
-        s1 = sampler.sample(4)
-        s2 = sampler.sample(4)
+        s1, _ = sampler.sample(4)
+        s2, _ = sampler.sample(4)
         sampler.reset()
-        s3 = sampler.sample(4)
+        s3, _ = sampler.sample(4)
         # After resetting, the sequence should match the first batch
         assert_allclose(s1, s3, atol=1e-7)
 
@@ -112,9 +114,10 @@ class TestClippedGaussianMixtureSampler:
             ]
         )
         sampler.fit(training_data)
-        samples = sampler.sample(5)
+        samples, metadata = sampler.sample(5)
         assert samples.shape == (5, 2)
         assert np.all(samples >= 0) and np.all(samples <= 1)
+        assert metadata["sampler_type"] == "adaptive"
 
     def test_fit_invalid_data(self):
         sampler = ClippedGaussianMixtureSampler(dimension=2, n_components=2)
@@ -147,73 +150,48 @@ class TestExploreExploitSampler:
         sampler = ExploreExploitSampler(
             explore_sampler=explore,
             exploit_sampler=exploit,
-            min_explore_samples=5,
-            min_fit_samples=3,
         )
         assert sampler.dimension == 2
-        assert sampler.min_explore_samples == 5
-        assert sampler.min_fit_samples == 3
-        assert sampler.sample_count == 0
+        assert not sampler.is_using_exploitation()
 
     def test_init_invalid(self):
         explore = UniformSampler(dimension=2)
-        exploit = ClippedGaussianMixtureSampler(dimension=2, n_components=2)
-
-        with pytest.raises(ValueError, match="must be positive"):
-            ExploreExploitSampler(explore, exploit, min_explore_samples=0)
-
-        with pytest.raises(ValueError, match="must be positive"):
-            ExploreExploitSampler(explore, exploit, min_fit_samples=0)
-
-        with pytest.raises(ValueError, match="cannot exceed"):
-            ExploreExploitSampler(
-                explore,
-                exploit,
-                min_explore_samples=5,
-                min_fit_samples=6,
-            )
-
         exploit_mismatch = ClippedGaussianMixtureSampler(dimension=3, n_components=2)
-        with pytest.raises(ValueError, match="same dimension"):
+        with pytest.raises(ValueError, match="must have the same dimensions"):
             ExploreExploitSampler(explore, exploit_mismatch)
 
     def test_sampling_flow(self):
         explore = SobolSampler(dimension=2)
         exploit = ClippedGaussianMixtureSampler(dimension=2, n_components=2)
-        sampler = ExploreExploitSampler(explore, exploit, min_explore_samples=5, min_fit_samples=2)
+        sampler = ExploreExploitSampler(explore, exploit)
 
         # Start in exploration mode
-        assert sampler.sample_count == 0
-        s1 = sampler.sample(n_samples=3)
+        assert not sampler.is_using_exploitation()
+        s1, metadata1 = sampler.sample(n_samples=3)
         assert s1.shape == (3, 2)
-        assert sampler.sample_count == 3
+        assert metadata1["phase"] == "explore"
         assert not sampler.is_using_exploitation()
 
-        # Now 2 more => total 5 => meets min_explore_samples, but not fitted
-        sampler.sample(n_samples=2)
-        assert sampler.sample_count == 5
-        assert not sampler.is_using_exploitation()
-
-        # Fit exploit with 2 "elite" samples => meets min_fit_samples
-        elite_data = np.random.rand(2, 2)
+        # Fit with some "elite" samples to switch to exploitation
+        elite_data = np.random.rand(3, 2)
         sampler.fit(elite_data)
         assert sampler.is_using_exploitation()
 
         # Now samples come from exploit
-        s2 = sampler.sample(2)
+        s2, metadata2 = sampler.sample(2)
         assert s2.shape == (2, 2)
-        assert sampler.sample_count == 7
+        assert metadata2["phase"] == "exploit"
 
     def test_reset(self):
         explore = UniformSampler(dimension=2)
         exploit = ClippedGaussianMixtureSampler(dimension=2, n_components=2)
-        sampler = ExploreExploitSampler(explore, exploit, 5, 2)
+        sampler = ExploreExploitSampler(explore, exploit)
 
-        sampler.sample(3)
-        assert sampler.sample_count == 3
+        # Fit with some data to enter exploitation mode
+        sampler.fit(np.random.rand(3, 2))
+        assert sampler.is_using_exploitation()
 
         sampler.reset()
-        assert sampler.sample_count == 0
         assert not sampler.is_using_exploitation()
 
         # Exploit sampler should need fitting again

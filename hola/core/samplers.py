@@ -349,6 +349,9 @@ class ExploreExploitSampler:
         :type exploit_sampler: HypercubeSampler
         :raises ValueError: If samplers have different dimensions
         """
+        if explore_sampler.dimension != exploit_sampler.dimension:
+            raise ValueError("Explore and exploit samplers must have the same dimensions")
+
         self._explore_sampler = explore_sampler
         self._exploit_sampler = exploit_sampler
         self._is_fitted = False
