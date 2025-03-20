@@ -251,17 +251,27 @@ class ScalarPoset(Generic[Key]):
         """
         Get the crowding distance for a trial.
 
-        In a scalar poset, all items have infinite crowding distance by definition.
+        For scalar posets, all crowding distances are infinity since
+        each trial forms its own front.
 
         :param key: Trial identifier
         :type key: Key
-        :return: Always returns infinity for scalar posets
+        :return: Crowding distance (always infinity for scalar posets)
         :rtype: float
         :raises KeyError: If key doesn't exist in the poset
         """
         if key not in self._scores:
-            raise KeyError(f"Key {key} not in poset.")
-        return float("inf")
+            raise KeyError(f"Entry {key} does not exist.")
+        return float("inf")  # All elements are by themselves; infinite crowding distance.
+
+    def get_indices(self) -> set[Key]:
+        """
+        Get the set of all keys in the poset.
+
+        :return: Set of all trial identifiers in the poset
+        :rtype: set[Key]
+        """
+        return set(self.sorted_keys)
 
     # -----------------------------------------------------------------------
     # Internal helpers
@@ -433,13 +443,22 @@ class VectorPoset(Generic[Key]):
 
         :param key: Trial identifier
         :type key: Key
-        :return: Crowding distance value
+        :return: Crowding distance for the trial
         :rtype: float
         :raises KeyError: If key doesn't exist in the poset
         """
         if key not in self._vectors:
-            raise KeyError(f"Key {key} not in poset.")
-        return self._crowding_distances.get(key, 0.0)
+            raise KeyError(f"Entry {key} does not exist.")
+        return self._crowding_distances.get(key, float("inf"))
+
+    def get_indices(self) -> set[Key]:
+        """
+        Get the set of all keys in the poset.
+
+        :return: Set of all trial identifiers in the poset
+        :rtype: set[Key]
+        """
+        return set(self._vectors.keys())
 
     def items_with_distances(self) -> Iterable[tuple[Key, FloatArray, float]]:
         """

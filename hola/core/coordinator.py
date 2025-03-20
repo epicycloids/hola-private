@@ -15,7 +15,7 @@ promising regions of the parameter space.
 """
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
 
 from hola.core.leaderboard import Leaderboard, Trial
@@ -103,20 +103,24 @@ class OptimizationCoordinator:
         if self.minimum_fit_samples <= 0:
             raise ValueError("minimum_fit_samples must be positive")
 
-    def suggest_parameters(self, n_samples: int = 1) -> list[dict[ParameterName, Any]]:
+    def suggest_parameters(self, n_samples: int = 1) -> Tuple[List[Dict[ParameterName, Any]], Dict[str, Any]]:
         """
         Generate parameter suggestions for new trials.
 
         :param n_samples: Number of parameter sets to generate
         :type n_samples: int
-        :return: List of parameter dictionaries
-        :rtype: list[dict[ParameterName, Any]]
+        :return: Tuple containing:
+            - List of parameter dictionaries
+            - Metadata about the generated samples
+        :rtype: Tuple[List[Dict[ParameterName, Any]], Dict[str, Any]]
         """
-        normalized_samples = self.hypercube_sampler.sample(n_samples)
-        return self.parameter_transformer.unnormalize(normalized_samples)
+        normalized_samples, metadata = self.hypercube_sampler.sample(n_samples)
+        param_dicts = self.parameter_transformer.unnormalize(normalized_samples)
+        return param_dicts, metadata
 
     def record_evaluation(
-        self, parameters: dict[ParameterName, Any], objectives: dict[ObjectiveName, float]
+        self, parameters: dict[ParameterName, Any], objectives: dict[ObjectiveName, float],
+        metadata: Optional[Dict[str, Any]] = None
     ) -> Trial | None:
         """
         Record a completed trial evaluation.
@@ -127,27 +131,35 @@ class OptimizationCoordinator:
         - Updates elite samples and adaptive sampling
         - Returns the best trial
 
+        Note:
+        - Trial metadata is stored separately from the main trial data
+        - Access metadata using the leaderboard's get_metadata() method
+        - The metadata provides insights into the sampling strategy used
+
         :param parameters: Parameter values
         :type parameters: dict[ParameterName, Any]
         :param objectives: Objective values
         :type objectives: dict[ObjectiveName, float]
+        :param metadata: Optional metadata about the trial
+        :type metadata: Optional[Dict[str, Any]]
         :return: Best trial
         :rtype: Trial | None
         """
         # Create trial with feasibility check
         feasible = self.parameter_transformer.is_feasible(parameters)
         trial = Trial(
-            trial_id=len(self.leaderboard),
+            trial_id=self.leaderboard.get_total_count(),
             objectives=objectives,
             parameters=parameters,
             is_feasible=feasible,
+            metadata=metadata or {},
         )
 
         # Add trial to leaderboard
         self.leaderboard.add(trial)
 
         # Fit sampler if enough samples are available
-        if feasible and self.top_frac * len(self.leaderboard) >= self.minimum_fit_samples:
+        if feasible and self.top_frac * self.leaderboard.get_feasible_count() >= self.minimum_fit_samples:
             self.hypercube_sampler.fit(
                 self.parameter_transformer.normalize(
                     [trial.parameters for trial in self.leaderboard.get_top_k(self.minimum_fit_samples)]
@@ -164,7 +176,7 @@ class OptimizationCoordinator:
         :return: Total number of trials evaluated
         :rtype: int
         """
-        return len(self.leaderboard)
+        return self.leaderboard.get_total_count()
 
     def get_best_trial(self) -> Trial | None:
         """
@@ -235,14 +247,84 @@ if __name__ == "__main__":
         f3 = (x-4)**2 + (y-4)**2
         return {"f1": f1, "f2": f2, "f3": f3}
 
-    for i in range(1000):
-        params_list = coordinator.suggest_parameters()
-        print(params_list)
+    # Track feasible and infeasible trials
+    feasible_count = 0
+    infeasible_count = 0
+    infinite_scores_count = 0
+
+    for i in range(100):  # Running 100 iterations
+        params_list, metadata = coordinator.suggest_parameters()
+        print(f"Iteration {i+1}: Using sampler: {metadata.get('sampler_class')} in phase: {metadata.get('phase', 'n/a')}")
+
         for params in params_list:
             objectives = evaluate(**params)
-            coordinator.record_evaluation(params, objectives)
-        print(coordinator.get_best_trial())
-        print(coordinator.get_total_evaluations())
-        print("-"*100)
 
-    print(coordinator.leaderboard.get_dataframe())
+            # Check parameter feasibility
+            feasible = coordinator.parameter_transformer.is_feasible(params)
+
+            # Check objective scores
+            scores = coordinator.leaderboard._objective_scorer.score(objectives)
+            has_infinite_scores = any(score == float("inf") for score in scores)
+
+            if feasible:
+                feasible_count += 1
+                if has_infinite_scores:
+                    infinite_scores_count += 1
+                    print(f"  Trial has infinite objective scores: {objectives}")
+            else:
+                infeasible_count += 1
+                print(f"  Trial has infeasible parameters: {params}")
+
+            coordinator.record_evaluation(params, objectives, metadata)
+
+        if (i+1) % 10 == 0:
+            print(f"Progress: {i+1}/100 iterations")
+            print(f"  Feasible trials: {feasible_count}")
+            print(f"  - With finite scores: {feasible_count - infinite_scores_count}")
+            print(f"  - With infinite scores: {infinite_scores_count}")
+            print(f"  Infeasible trials: {infeasible_count}")
+            print(f"  Total trials: {feasible_count + infeasible_count}")
+            print("-"*80)
+
+    # Print final statistics
+    print("\nFinal Statistics:")
+    print(f"Total trials processed: {feasible_count + infeasible_count}")
+    print(f"Feasible trials: {feasible_count}")
+    print(f"- With finite scores: {feasible_count - infinite_scores_count}")
+    print(f"- With infinite scores: {infinite_scores_count}")
+    print(f"Infeasible trials: {infeasible_count}")
+
+    # Count trials in different data structures
+    print(f"Trials in leaderboard._data: {len(coordinator.leaderboard._data)}")
+    print(f"Trials in leaderboard._poset (ranked trials): {coordinator.leaderboard.get_ranked_count()}")
+    print(f"Total trials: {coordinator.leaderboard.get_total_count()}")
+    print(f"Feasible trials: {coordinator.leaderboard.get_feasible_count()}")
+    print(f"Feasible with infinite scores: {coordinator.leaderboard.get_feasible_infinite_count()}")
+    print(f"Infeasible trials: {coordinator.leaderboard.get_infeasible_count()}")
+
+    # Get and display ranked trial information
+    trial_df = coordinator.leaderboard.get_dataframe()
+    print(f"\nRanked Trials DataFrame has {len(trial_df)} rows")
+    print(trial_df.head())
+
+    # Get and display ALL trials including those with infinite scores
+    all_trials_df = coordinator.leaderboard.get_all_trials_dataframe()
+    print(f"\nAll Trials DataFrame has {len(all_trials_df)} rows")
+    print(f"- Ranked trials: {len(all_trials_df[all_trials_df['Is Ranked']])}")
+    print(f"- Unranked trials: {len(all_trials_df[~all_trials_df['Is Ranked']])}")
+    print(all_trials_df.head())
+
+    # Get and display metadata separately
+    metadata_df = coordinator.leaderboard.get_metadata()
+    print(f"\nMetadata DataFrame has {len(metadata_df)} rows")
+
+    # Verify metadata is present for both ranked and unranked trials
+    ranked_ids = set(trial_df['Trial'])
+    ranked_metadata = metadata_df[metadata_df.index.isin(ranked_ids)]
+    unranked_metadata = metadata_df[~metadata_df.index.isin(ranked_ids)]
+    print(f"- Metadata entries for ranked trials: {len(ranked_metadata)}")
+    print(f"- Metadata entries for unranked trials: {len(unranked_metadata)}")
+
+    print("\nSample metadata for unranked trial with infinite scores:")
+    if len(unranked_metadata) > 0:
+        print(unranked_metadata.head(1))

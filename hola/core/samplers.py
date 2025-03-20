@@ -11,7 +11,7 @@ protocol, allowing them to be used interchangeably in the optimization process.
 """
 
 import logging
-from typing import Protocol, TypeAlias, Union
+from typing import Protocol, TypeAlias, Union, Dict, Any, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -42,14 +42,16 @@ class HypercubeSampler(Protocol):
         """
         ...
 
-    def sample(self, n_samples: int = 1) -> npt.NDArray[np.float64]:
+    def sample(self, n_samples: int = 1) -> Tuple[npt.NDArray[np.float64], Dict[str, Any]]:
         """
         Generate samples from the unit hypercube.
 
         :param n_samples: Number of samples to generate
         :type n_samples: int
-        :return: Array of shape (n_samples, dimension) containing samples
-        :rtype: npt.NDArray[np.float64]
+        :return: Tuple containing:
+            - Array of shape (n_samples, dimension) containing samples
+            - Dictionary of metadata about the samples
+        :rtype: Tuple[npt.NDArray[np.float64], Dict[str, Any]]
         """
         ...
 
@@ -95,20 +97,26 @@ class UniformSampler:
         """
         return self._dimension
 
-    def sample(self, n_samples: int = 1) -> npt.NDArray[np.float64]:
+    def sample(self, n_samples: int = 1) -> Tuple[npt.NDArray[np.float64], Dict[str, Any]]:
         """
         Generate uniform random samples from [0,1]^d.
 
         :param n_samples: Number of samples to generate
         :type n_samples: int
-        :return: Array of shape (n_samples, dimension) containing uniform
-            samples
-        :rtype: npt.NDArray[np.float64]
+        :return: Tuple containing:
+            - Array of shape (n_samples, dimension) containing uniform samples
+            - Dictionary of metadata about the samples
+        :rtype: Tuple[npt.NDArray[np.float64], Dict[str, Any]]
         :raises ValueError: If n_samples <= 0
         """
         if n_samples <= 0:
             raise ValueError("n_samples must be positive.")
-        return np.random.rand(n_samples, self.dimension)
+        samples = np.random.rand(n_samples, self.dimension)
+        metadata = {
+            "sampler_type": "uniform",
+            "sampler_class": self.__class__.__name__,
+        }
+        return samples, metadata
 
     def fit(self, samples: npt.NDArray[np.float64]) -> None:
         """No-op as uniform sampling is non-adaptive."""
@@ -150,20 +158,27 @@ class SobolSampler:
         """
         return self._dimension
 
-    def sample(self, n_samples: int = 1) -> npt.NDArray[np.float64]:
+    def sample(self, n_samples: int = 1) -> Tuple[npt.NDArray[np.float64], Dict[str, Any]]:
         """
         Generate samples from the Sobol sequence.
 
         :param n_samples: Number of samples to generate
         :type n_samples: int
-        :return: Array of shape (n_samples, dimension) containing Sobol
-            sequence samples
-        :rtype: npt.NDArray[np.float64]
+        :return: Tuple containing:
+            - Array of shape (n_samples, dimension) containing Sobol sequence samples
+            - Dictionary of metadata about the samples
+        :rtype: Tuple[npt.NDArray[np.float64], Dict[str, Any]]
         :raises ValueError: If n_samples <= 0
         """
         if n_samples <= 0:
             raise ValueError("n_samples must be positive.")
-        return self._sampler.random(n_samples).astype(np.float64)
+        samples = self._sampler.random(n_samples).astype(np.float64)
+        metadata = {
+            "sampler_type": "quasi-random",
+            "sampler_class": self.__class__.__name__,
+            "sequence_type": "sobol",
+        }
+        return samples, metadata
 
     def fit(self, samples: npt.NDArray[np.float64]) -> None:
         """No-op as Sobol sampling is non-adaptive."""
@@ -238,21 +253,23 @@ class ClippedGaussianMixtureSampler:
         """
         return self._n_components
 
-    def sample(self, n_samples: int = 1) -> npt.NDArray[np.float64]:
+    def sample(self, n_samples: int = 1) -> Tuple[npt.NDArray[np.float64], Dict[str, Any]]:
         """
         Generate samples from the fitted GMM, clipped to [0,1]^d.
 
         :param n_samples: Number of samples to generate
         :type n_samples: int
-        :return: Array of shape (n_samples, dimension) containing samples
-        :rtype: npt.NDArray[np.float64]
+        :return: Tuple containing:
+            - Array of shape (n_samples, dimension) containing samples
+            - Dictionary of metadata about the samples
+        :rtype: Tuple[npt.NDArray[np.float64], Dict[str, Any]]
         :raises ValueError: If sampler hasn't been fitted yet
         """
         if self._gmm_chols is None:
             raise ValueError("Call fit(...) before generating samples.")
 
         # Sample from the (d+1)-dim hypercube to pick mixture comp + latents
-        u_samples = self._hypercube_sampler.sample(n_samples)
+        u_samples, _ = self._hypercube_sampler.sample(n_samples)
 
         # Component selection from the first coordinate
         comps = uniform_to_category(u_samples[:, 0], self.n_components)
@@ -270,7 +287,17 @@ class ClippedGaussianMixtureSampler:
 
         # Clip to [0,1]^d
         np.clip(samples, 0.0, 1.0, out=samples)
-        return samples
+
+        metadata = {
+            "sampler_type": "adaptive",
+            "sampler_class": self.__class__.__name__,
+            "model_type": "gaussian_mixture",
+            "n_components": self.n_components,
+            "is_fitted": True,
+            "components_used": comps.tolist(),
+        }
+
+        return samples, metadata
 
     def fit(self, samples: npt.NDArray[np.float64]) -> None:
         """
@@ -346,21 +373,30 @@ class ExploreExploitSampler:
         """
         return self._is_fitted
 
-    def sample(self, n_samples: int = 1) -> npt.NDArray[np.float64]:
+    def sample(self, n_samples: int = 1) -> Tuple[npt.NDArray[np.float64], Dict[str, Any]]:
         """
         Generate samples using either exploration or exploitation strategy.
 
         :param n_samples: Number of samples to generate
         :type n_samples: int
-        :return: Array of shape (n_samples, dimension) containing samples
-        :rtype: npt.NDArray[np.float64]
+        :return: Tuple containing:
+            - Array of shape (n_samples, dimension) containing samples
+            - Dictionary of metadata about the samples
+        :rtype: Tuple[npt.NDArray[np.float64], Dict[str, Any]]
         """
-        if self.is_using_exploitation():
-            sampler = self._exploit_sampler
-        else:
-            sampler = self._explore_sampler
+        is_exploit = self.is_using_exploitation()
+        sampler = self._exploit_sampler if is_exploit else self._explore_sampler
 
-        return sampler.sample(n_samples)
+        samples, inner_metadata = sampler.sample(n_samples)
+
+        metadata = {
+            "sampler_type": "explore_exploit",
+            "sampler_class": self.__class__.__name__,
+            "phase": "exploit" if is_exploit else "explore",
+            "inner_sampler": inner_metadata,
+        }
+
+        return samples, metadata
 
     def fit(self, samples: npt.NDArray[np.float64]) -> None:
         """
