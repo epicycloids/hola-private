@@ -17,26 +17,11 @@ promising regions of the parameter space.
 from dataclasses import dataclass, field
 from typing import Any
 
-from msgspec import Struct
 
 from hola.core.leaderboard import Leaderboard, Trial
 from hola.core.objectives import ObjectiveName, ObjectiveScorer
 from hola.core.parameters import ParameterName, ParameterTransformer
 from hola.core.samplers import HypercubeSampler
-
-
-class OptimizationState(Struct, frozen=True):
-    """
-    Immutable snapshot of the current optimization state.
-
-    Used to provide status updates about the optimization progress.
-    """
-
-    best_result: Trial | None
-    """Best trial found so far, or None if no feasible trials exist."""
-
-    total_evaluations: int
-    """Total number of trials evaluated."""
 
 
 @dataclass
@@ -64,6 +49,9 @@ class OptimizationCoordinator:
     top_frac: float = field(default=0.2)
     """Fraction of best trials to use for adaptive sampling."""
 
+    minimum_fit_samples: int = field(default=20)
+    """Minimum number of elite samples needed to fit exploit sampler."""
+
     _current_elite_indices: set[int] = field(default_factory=set, init=False)
     """Set of indices for current elite trials."""
 
@@ -73,6 +61,8 @@ class OptimizationCoordinator:
         hypercube_sampler: HypercubeSampler,
         objectives_dict: dict[ObjectiveName, dict[str, Any]],
         parameters_dict: dict[ParameterName, dict[str, Any]],
+        top_frac: float = 0.2,
+        minimum_fit_samples: int = 20,
     ) -> "OptimizationCoordinator":
         """
         Create coordinator from configuration dictionaries.
@@ -83,6 +73,10 @@ class OptimizationCoordinator:
         :type objectives_dict: dict[ObjectiveName, dict[str, Any]]
         :param parameters_dict: Parameter configuration dictionary
         :type parameters_dict: dict[ParameterName, dict[str, Any]]
+        :param top_frac: Fraction of best trials to use for adaptive sampling
+        :type top_frac: float
+        :param minimum_fit_samples: Minimum number of elite samples needed to fit exploit sampler
+        :type minimum_fit_samples: int
         :return: Configured optimization coordinator
         :rtype: OptimizationCoordinator
         """
@@ -93,6 +87,8 @@ class OptimizationCoordinator:
             hypercube_sampler=hypercube_sampler,
             leaderboard=leaderboard,
             parameter_transformer=parameter_transformer,
+            top_frac=top_frac,
+            minimum_fit_samples=minimum_fit_samples,
         )
 
     def __post_init__(self) -> None:
@@ -104,81 +100,8 @@ class OptimizationCoordinator:
         if not 0 < self.top_frac <= 1:
             raise ValueError("top_frac must be in (0, 1]")
 
-    def get_state(self) -> OptimizationState:
-        """
-        Get current optimization state.
-
-        :return: Snapshot of current state
-        :rtype: OptimizationState
-        """
-        return OptimizationState(
-            best_result=self.get_best_trial(), total_evaluations=self.get_total_evaluations()
-        )
-
-    def get_best_trial(self) -> Trial | None:
-        """
-        Get the best trial found so far.
-
-        :return: Best trial, or None if no feasible trials exist
-        :rtype: Trial | None
-        """
-        return self.leaderboard.get_best_trial()
-
-    def get_total_evaluations(self) -> int:
-        """
-        Get total number of trials evaluated.
-
-        :return: Number of trials
-        :rtype: int
-        """
-        return len(self.leaderboard)
-
-    def update_objective_config(self, new_config: dict[ObjectiveName, dict[str, Any]]) -> None:
-        """
-        Update objective configuration.
-
-        This method:
-        1. Creates new objective scorer from config
-        2. Updates leaderboard scoring
-        3. Updates elite samples and adaptive sampling
-
-        :param new_config: New objective configuration
-        :type new_config: dict[ObjectiveName, dict[str, Any]]
-        """
-        new_scorer = ObjectiveScorer.from_dict(new_config)
-        self.leaderboard.update_objective_scorer(new_scorer)
-        self._update_elite_samples()
-
-    def update_parameter_config(self, new_config: dict[str, dict[str, Any]]) -> None:
-        """
-        Update parameter configuration.
-
-        This method:
-        1. Checks for domain expansion
-        2. Updates parameter transformer
-        3. Rebuilds leaderboard with new feasibility checks
-        4. Resets sampler if domain expanded
-        5. Updates elite samples and adaptive sampling
-
-        :param new_config: New parameter configuration
-        :type new_config: dict[str, dict[str, Any]]
-        """
-        # Check for domain expansion
-        new_transformer = ParameterTransformer.from_dict(new_config)
-        should_restart_sampler = new_transformer.has_expanded_domain(self.parameter_transformer)
-
-        # Update parameter transformer
-        self.parameter_transformer = new_transformer
-
-        # Rebuild leaderboard poset with feasibility checks
-        self.leaderboard.rebuild_leaderboard(self.parameter_transformer)
-
-        # Restart sampler if needed
-        if should_restart_sampler:
-            self.hypercube_sampler.reset()
-
-        # Update elite set and fit sampler
-        self._update_elite_samples()
+        if self.minimum_fit_samples <= 0:
+            raise ValueError("minimum_fit_samples must be positive")
 
     def suggest_parameters(self, n_samples: int = 1) -> list[dict[ParameterName, Any]]:
         """
@@ -194,70 +117,132 @@ class OptimizationCoordinator:
 
     def record_evaluation(
         self, parameters: dict[ParameterName, Any], objectives: dict[ObjectiveName, float]
-    ) -> None:
+    ) -> Trial | None:
         """
         Record a completed trial evaluation.
 
         This method:
-        1. Creates a trial from the evaluation
-        2. Adds it to the leaderboard
-        3. Updates elite samples and adaptive sampling
+        - Creates a trial from the evaluation
+        - Adds it to the leaderboard
+        - Updates elite samples and adaptive sampling
+        - Returns the best trial
 
-        :param evaluation: Evaluation results
-        :type evaluation: Evaluation
-        :param timestamp: Optional timestamp for the evaluation
-        :type timestamp: str | None
-        :param worker_id: Optional ID of worker that performed evaluation
-        :type worker_id: UUID | None
+        :param parameters: Parameter values
+        :type parameters: dict[ParameterName, Any]
+        :param objectives: Objective values
+        :type objectives: dict[ObjectiveName, float]
+        :return: Best trial
+        :rtype: Trial | None
         """
         # Create trial with feasibility check
+        feasible = self.parameter_transformer.is_feasible(parameters)
         trial = Trial(
             trial_id=len(self.leaderboard),
             objectives=objectives,
             parameters=parameters,
-            is_feasible=self.parameter_transformer.is_feasible(parameters),
+            is_feasible=feasible,
         )
 
         # Add trial to leaderboard
         self.leaderboard.add(trial)
 
-        self._update_elite_samples()
-
-    def _update_elite_samples(self) -> bool:
-        """
-        Update the set of elite samples and fit the sampler.
-
-        Elite samples are the top fraction (top_frac) of feasible trials,
-        used to guide the adaptive sampling strategy.
-
-        :return: True if elite set changed, False otherwise
-        :rtype: bool
-        """
-        feasible_count = sum(1 for t in self.leaderboard._data.values() if t.is_feasible)
-        if not feasible_count:
-            if self._current_elite_indices:
-                self._current_elite_indices.clear()
-                return True
-            return False
-
-        # Calculate number of elite samples
-        n_elite = max(1, int(feasible_count * self.top_frac))
-
-        # Get top n_elite trials
-        elite_trials = self.leaderboard.get_top_k(n_elite)
-        new_elite_indices = {
-            idx for idx, t in enumerate(self.leaderboard._data) if t in elite_trials
-        }
-
-        # Check if elite set changed
-        if new_elite_indices != self._current_elite_indices:
-            self._current_elite_indices = new_elite_indices
-
-            # Convert elite trials to normalized parameters and fit
-            elite_params = self.parameter_transformer.normalize(
-                [trial.parameters for trial in elite_trials]
+        # Fit sampler if enough samples are available
+        if feasible and self.top_frac * len(self.leaderboard) >= self.minimum_fit_samples:
+            self.hypercube_sampler.fit(
+                self.parameter_transformer.normalize(
+                    [trial.parameters for trial in self.leaderboard.get_top_k(self.minimum_fit_samples)]
+                )
             )
-            self.hypercube_sampler.fit(elite_params)
-            return True
 
-        return False
+        # Get the new best objectives
+        return self.get_best_trial()
+
+    def get_total_evaluations(self) -> int:
+        """
+        Get the total number of evaluations processed.
+
+        :return: Total number of trials evaluated
+        :rtype: int
+        """
+        return len(self.leaderboard)
+
+    def get_best_trial(self) -> Trial | None:
+        """
+        Get the best trial from the leaderboard.
+
+        :return: Best trial
+        :rtype: Trial | None
+        """
+        return self.leaderboard.get_best_trial()
+
+
+if __name__ == "__main__":
+    from hola.core.coordinator import OptimizationCoordinator
+    from hola.core.samplers import ExploreExploitSampler, SobolSampler, ClippedGaussianMixtureSampler
+
+    # Define your parameters
+    parameters = {
+        "x": {"type": "continuous", "min": 0.0, "max": 10.0},
+        "y": {"type": "continuous", "min": 0.0, "max": 10.0},
+    }
+
+    # Define your objectives
+    objectives = {
+        "f1": {
+            "target": 0.0,
+            "limit": 100.0,
+            "direction": "minimize",
+            "priority": 1.0,
+            "comparison_group": 0
+        },
+        "f2": {
+            "target": 0.0,
+            "limit": 100.0,
+            "direction": "minimize",
+            "priority": 0.8,
+            "comparison_group": 0
+        },
+        "f3": {
+            "target": 0.0,
+            "limit": 100.0,
+            "direction": "minimize",
+            "priority": 0.5,
+            "comparison_group": 1
+        },
+    }
+
+    # Create samplers for exploration and exploitation
+    explore_sampler = SobolSampler(dimension=2)
+    exploit_sampler = ClippedGaussianMixtureSampler(dimension=2, n_components=2)
+
+    # Create an explore-exploit sampler (combines exploration and exploitation)
+    sampler = ExploreExploitSampler(
+        explore_sampler=explore_sampler,
+        exploit_sampler=exploit_sampler,
+    )
+
+    # Create coordinator
+    coordinator = OptimizationCoordinator.from_dict(
+        hypercube_sampler=sampler,
+        objectives_dict=objectives,
+        parameters_dict=parameters
+    )
+
+    # Define your evaluation function
+    def evaluate(x: float, y: float) -> dict[str, float]:
+        f1 = x**2 + y**2
+        f2 = (x-2)**2 + (y-2)**2
+        f3 = (x-4)**2 + (y-4)**2
+        return {"f1": f1, "f2": f2, "f3": f3}
+
+    for i in range(1000):
+        params_list = coordinator.suggest_parameters()
+        print(params_list)
+        for params in params_list:
+            objectives = evaluate(**params)
+            coordinator.record_evaluation(params, objectives)
+        print(coordinator.get_best_trial())
+        print(coordinator.get_total_evaluations())
+        print("-"*100)
+
+    print(coordinator.leaderboard.get_dataframe())

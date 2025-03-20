@@ -191,7 +191,6 @@ class ClippedGaussianMixtureSampler:
         dimension: int,
         n_components: int,
         reg_covar: float = 1e-6,
-        hypercube_sampler: HypercubeSampler | None = None,  # TODO: add a static HypercubeSampler protocol
     ):
         """
         Initialize the GMM sampler.
@@ -202,11 +201,6 @@ class ClippedGaussianMixtureSampler:
         :type n_components: int
         :param reg_covar: Regularization for component covariances
         :type reg_covar: float
-        :param hypercube_sampler: Sampler for component selection and latent
-            space
-        :type hypercube_sampler: HypercubeSampler | None
-        :raises ValueError: If dimension <= 0, n_components <= 0, reg_covar <
-            0, or if hypercube_sampler dimension != dimension + 1
         """
         if dimension <= 0:
             raise ValueError("dimension must be positive.")
@@ -226,11 +220,7 @@ class ClippedGaussianMixtureSampler:
         self._reg_covar = reg_covar
         self._dimension = dimension
 
-        if hypercube_sampler is None:
-            hypercube_sampler = UniformSampler(dimension + 1)
-        if hypercube_sampler.dimension != dimension + 1:
-            raise ValueError("The hypercube_sampler must have dimension+1 for mixture selection.")
-        self._hypercube_sampler = hypercube_sampler
+        self._hypercube_sampler = UniformSampler(dimension + 1)  # Sobol' does not really make sense here because the GMM may be refitted
 
     @property
     def dimension(self) -> int:
@@ -325,8 +315,6 @@ class ExploreExploitSampler:
         self,
         explore_sampler: HypercubeSampler,
         exploit_sampler: HypercubeSampler,
-        min_explore_samples: int = 10,
-        min_fit_samples: int = 5,
     ):
         """
         Initialize the explore-exploit sampler.
@@ -335,31 +323,10 @@ class ExploreExploitSampler:
         :type explore_sampler: HypercubeSampler
         :param exploit_sampler: Sampler to use during exploitation phase
         :type exploit_sampler: HypercubeSampler
-        :param min_explore_samples: Minimum samples before exploitation can
-            begin
-        :type min_explore_samples: int
-        :param min_fit_samples: Minimum elite samples needed to fit exploit
-            sampler
-        :type min_fit_samples: int
-        :raises ValueError: If min_explore_samples <= 0, min_fit_samples <= 0,
-            min_fit_samples > min_explore_samples, or if samplers have
-            different dimensions
+        :raises ValueError: If samplers have different dimensions
         """
-        if min_explore_samples <= 0:
-            raise ValueError("min_explore_samples must be positive.")
-        if min_fit_samples <= 0:
-            raise ValueError("min_fit_samples must be positive.")
-        if min_fit_samples > min_explore_samples:
-            raise ValueError("min_fit_samples cannot exceed min_explore_samples.")
-        if exploit_sampler.dimension != explore_sampler.dimension:
-            raise ValueError("Both samplers must have the same dimension.")
-
         self._explore_sampler = explore_sampler
         self._exploit_sampler = exploit_sampler
-        self._min_explore_samples = min_explore_samples
-        self._min_fit_samples = min_fit_samples
-
-        self._generated_samples = 0
         self._is_fitted = False
 
     @property
@@ -370,44 +337,6 @@ class ExploreExploitSampler:
         """
         return self._explore_sampler.dimension
 
-    @property
-    def sample_count(self) -> int:
-        """
-        :return: Total number of samples generated
-        :rtype: int
-        """
-        return self._generated_samples
-
-    @property
-    def min_explore_samples(self) -> int:
-        """
-        :return: Minimum samples required before exploitation can begin
-        :rtype: int
-        """
-        return self._min_explore_samples
-
-    @property
-    def min_fit_samples(self) -> int:
-        """
-        :return: Minimum elite samples needed to fit exploit sampler
-        :rtype: int
-        """
-        return self._min_fit_samples
-
-    def is_ready_to_fit(self, num_elite_samples: int) -> bool:
-        """
-        Check if the sampler is ready to fit the exploitation strategy.
-
-        :param num_elite_samples: Number of elite samples available
-        :type num_elite_samples: int
-        :return: True if ready to fit, False otherwise
-        :rtype: bool
-        """
-        return (
-            self.sample_count >= self.min_explore_samples
-            and num_elite_samples >= self.min_fit_samples
-        )
-
     def is_using_exploitation(self) -> bool:
         """
         Check if currently in exploitation phase.
@@ -415,7 +344,7 @@ class ExploreExploitSampler:
         :return: True if using exploitation sampler, False if exploring
         :rtype: bool
         """
-        return self.sample_count >= self.min_explore_samples and self._is_fitted
+        return self._is_fitted
 
     def sample(self, n_samples: int = 1) -> npt.NDArray[np.float64]:
         """
@@ -431,9 +360,7 @@ class ExploreExploitSampler:
         else:
             sampler = self._explore_sampler
 
-        results = sampler.sample(n_samples)
-        self._generated_samples += n_samples
-        return results
+        return sampler.sample(n_samples)
 
     def fit(self, samples: npt.NDArray[np.float64]) -> None:
         """
@@ -447,9 +374,6 @@ class ExploreExploitSampler:
         if samples.ndim != 2 or samples.shape[1] != self.dimension:
             raise ValueError("samples must be 2D and match the sampler dimension.")
 
-        if not self.is_ready_to_fit(len(samples)):
-            return
-
         try:
             self._exploit_sampler.fit(samples)
             self._is_fitted = True
@@ -459,7 +383,6 @@ class ExploreExploitSampler:
 
     def reset(self) -> None:
         """Reset the sampler to its initial state."""
-        self._generated_samples = 0
         self._is_fitted = False
         self._explore_sampler.reset()
         self._exploit_sampler.reset()

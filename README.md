@@ -50,7 +50,7 @@ The scoring system works as follows:
 ## Usage Example
 
 ```python
-from hola import HOLA, SystemConfig
+from hola import run_optimization_system
 from hola.core.coordinator import OptimizationCoordinator
 from hola.core.samplers import ExploreExploitSampler, SobolSampler, ClippedGaussianMixtureSampler
 
@@ -103,26 +103,7 @@ def evaluate(x: float, y: float) -> dict[str, float]:
     f2 = (x-2)**2 + (y-2)**2
     return {"f1": f1, "f2": f2}
 
-# Configure the system
-config = SystemConfig(
-    local_workers=4,           # Number of local workers
-    use_ipc_ratio=0.5,         # Half use IPC, half use TCP
-    server_host="localhost",   # Server host address
-    server_port=8000,          # Server port
-    timeout=60                 # Optional timeout in seconds
-)
-
-# Run the optimization using context manager
-with HOLA(coordinator, evaluate, config) as system:
-    # Add more workers if needed during optimization
-    system.add_workers(2, use_ipc=True)    # Add 2 more IPC workers
-    system.add_workers(1, use_ipc=False)   # Add 1 more TCP worker
-
-    # Wait for optimization to complete
-    system.wait_until_complete()
-
-    # Get final results
-    result = system.get_final_state()
+# TODO: Run the optimization system
 
 print(f"Best parameters: {result.best_result.parameters}")
 print(f"Best objectives: {result.best_result.objectives}")
@@ -141,75 +122,6 @@ The distributed system consists of three main components:
 3. **REST API Server**: Provides HTTP access for remote clients
 4. **Monitoring Dashboard**: Visualizes optimization progress
 
-### Running a Distributed Optimization
-
-#### Using Command-Line Tools
-
-1. Start the optimization server:
-   ```bash
-   bin/hola-server --host 0.0.0.0 --port 8000
-   ```
-
-2. Launch the monitoring dashboard:
-   ```bash
-   bin/hola-monitor --server-url http://localhost:8000 --port 8050
-   ```
-
-3. Connect workers to the server:
-   ```python
-   from hola import HOLA, SystemConfig
-
-   # Define your evaluation function
-   def evaluate(x, y):
-       return {"objective": x**2 + y**2}
-
-   # Configure the system
-   config = SystemConfig(
-       local_workers=8,        # Number of local workers
-       use_ipc_ratio=0.5,      # Half use IPC, half use TCP
-       server_host="localhost",
-       server_port=8000,
-       timeout=60
-   )
-
-   # Run the optimization using context manager
-   with HOLA(coordinator, evaluate, config) as system:
-       system.wait_until_complete()
-       result = system.get_final_state()
-   ```
-
-#### Using the API Directly
-
-```python
-from hola import SchedulerProcess, Server, LocalWorker, start_workers, setup_logging
-
-# Setup logging
-logger = setup_logging("OptimizationSystem")
-
-# Start scheduler
-scheduler = SchedulerProcess(coordinator)
-scheduler_process = mp.Process(target=scheduler.run)
-scheduler_process.start()
-
-# Start server
-server = Server(host="0.0.0.0", port=8000)
-server.start()
-
-# Start workers
-workers = start_workers(
-    eval_function=evaluate_function,
-    num_workers=4,
-    server_url="http://localhost:8000",
-    use_ipc=True
-)
-
-# When done, clean up
-stop_workers(workers)
-server.stop()
-scheduler_process.terminate()
-scheduler_process.join()
-```
-
 ### Communication Protocols
 
 HOLA supports multiple communication protocols:
@@ -220,7 +132,7 @@ HOLA supports multiple communication protocols:
 
 ### Worker Implementation
 
-Workers can be implemented in any language that supports HTTP requests:
+Workers can be implemented in any language that supports ZMQ or HTTP requests:
 
 - **Python Workers**: Use the built-in `LocalWorker` class
 - **Custom Workers**: Implement the protocol in any language
@@ -232,51 +144,13 @@ The worker protocol is simple:
 
 ### Monitoring
 
-The dashboard provides real-time monitoring of:
+The Streamlit-based dashboard provides real-time monitoring of:
 
 - Number of active workers
 - Total evaluations performed
 - Best objectives found so far
 - Optimization progress over time
-- Parameter space exploration visualization
-
-## System Utilities
-
-HOLA provides several utilities to help manage the optimization system:
-
-### Centralized Logging
-
-```python
-from hola import setup_logging
-
-# Create a logger with a specific name and level
-logger = setup_logging(
-    name="MyComponent",
-    level="INFO",
-    log_dir="/path/to/logs"  # Optional
-)
-
-# Use the logger
-logger.info("Starting optimization")
-logger.error("Something went wrong")
-```
-
-### Worker Management
-
-```python
-from hola import start_workers, stop_workers
-
-# Start workers
-workers = start_workers(
-    eval_function=my_evaluation_function,
-    num_workers=4,
-    server_url="http://localhost:8000",
-    use_ipc=True
-)
-
-# Stop workers when done
-stop_workers(workers)
-```
+- Historical trial data
 
 ## Advanced Features
 

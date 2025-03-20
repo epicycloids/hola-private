@@ -3,14 +3,15 @@ import multiprocessing as mp
 import sys
 import threading
 import time
+import asyncio
 from datetime import datetime
 from multiprocessing.sharedctypes import Synchronized
-from typing import Any, Callable
+from typing import Any, Callable, List, Dict
 
 import msgspec
 import uvicorn
 import zmq
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from msgspec import Struct
 
 from hola.core.coordinator import OptimizationCoordinator
@@ -87,6 +88,7 @@ class GetSuggestionResponse(Struct, tag="suggestion_response"):
 
 class SubmitResultResponse(Struct, tag="result_response"):
     success: bool
+    is_best: bool = False
     error: str | None = None
 
 
@@ -109,7 +111,7 @@ Message = (
 
 
 # ============================================================================
-# Scheduler Implementation
+# SchedulerProcess Implementation
 # ============================================================================
 
 
@@ -123,6 +125,8 @@ class SchedulerProcess:
             "i", 0
         )  # Shared counter for active workers
         self.logger = setup_logging("Scheduler")
+        # Track results for faster state retrieval
+        self.result_history: List[Result] = []
 
     def run(self):
         context: zmq.Context = zmq.Context()
@@ -149,8 +153,9 @@ class SchedulerProcess:
                             socket.send(msgspec.json.encode(response))
 
                         case SubmitResultRequest():
-                            self.register_completed(message.result)
-                            response = SubmitResultResponse(success=True)
+                            is_best = self.register_completed(message.result)
+                            # Add is_best flag to the response
+                            response = SubmitResultResponse(success=True, is_best=is_best)
                             socket.send(msgspec.json.encode(response))
 
                         case ShutdownRequest():
@@ -159,11 +164,10 @@ class SchedulerProcess:
 
                         case StatusRequest():
                             try:
-                                state = self.coordinator.get_state()
                                 response = StatusResponse(
                                     active_workers=self.active_workers.value,
-                                    total_evaluations=state.total_evaluations,
-                                    best_objectives=state.best_result.objectives if state.best_result else None
+                                    total_evaluations=self.coordinator.get_total_evaluations(),
+                                    best_objectives=self.coordinator.get_best_objectives()
                                 )
                                 socket.send(msgspec.json.encode(response))
                             except Exception as e:
@@ -193,14 +197,23 @@ class SchedulerProcess:
             return None
         return suggestions[0]
 
-    def register_completed(self, result: Result):
-        self.coordinator.record_evaluation(result.parameters, result.objectives)
-        state = self.coordinator.get_state()
+    def register_completed(self, result: Result) -> bool:
+        """Register a completed evaluation and return whether it's the best result."""
+        # Add to history
+        self.result_history.append(result)
+
+        # Use coordinator to determine if this is the best result
+        is_best = self.coordinator.evaluate_and_determine_if_best(
+            result.parameters, result.objectives
+        )
+
         self.logger.info(
             f"Trial completed: objectives={result.objectives}, "
-            f"total_evaluations={state.total_evaluations}, "
-            f"best_result={state.best_result}"
+            f"total_evaluations={self.coordinator.get_total_evaluations()}, "
+            f"is_best={is_best}"
         )
+
+        return is_best
 
 
 # ============================================================================
@@ -342,8 +355,14 @@ class Server:
         self.rest_app = FastAPI()
         self.setup_rest_routes()
 
+        # WebSocket connections manager for clients
+        self.active_connections: List[WebSocket] = []
+
         self.running: bool = False
         self.logger = setup_logging("Server")
+
+        # Server thread
+        self.server_thread = None
 
     def setup_rest_routes(self) -> None:
         @self.rest_app.get("/suggestion", response_model=None)
@@ -375,15 +394,36 @@ class Server:
                 body = await request.body()
                 result = msgspec.json.decode(body, type=RESTSubmitResult)
 
-                request = SubmitResultRequest(
-                    worker_id=-1,
-                    result=Result(parameters=result.parameters, objectives=result.objectives),
-                )
+                # Create result request
+                result_obj = Result(parameters=result.parameters, objectives=result.objectives)
+                request = SubmitResultRequest(worker_id=-1, result=result_obj)
                 self.socket.send(msgspec.json.encode(request))
 
+                # Get response from scheduler
                 response = msgspec.json.decode(self.socket.recv(), type=Message)
+
                 match response:
-                    case SubmitResultResponse(success=success, error=error):
+                    case SubmitResultResponse(success=success, is_best=is_best, error=error):
+                        # If successful, get current state to broadcast to clients
+                        if success:
+                            # Request current status to get total_evaluations and active_workers
+                            self.socket.send(msgspec.json.encode(StatusRequest()))
+                            status_response = msgspec.json.decode(self.socket.recv(), type=Message)
+
+                            if isinstance(status_response, StatusResponse):
+                                # Create result data for clients
+                                result_data = {
+                                    "parameters": result.parameters,
+                                    "objectives": result.objectives,
+                                    "is_best": is_best,
+                                    "active_workers": status_response.active_workers,
+                                    "total_evaluations": status_response.total_evaluations
+                                }
+
+                                # Broadcast to WebSocket clients
+                                if self.active_connections:
+                                    asyncio.create_task(self.broadcast_result(result_data))
+
                         return msgspec.json.encode(RESTSubmitResponse(success=success, error=error))
                     case _:
                         return msgspec.json.encode(
@@ -393,9 +433,35 @@ class Server:
                         )
 
             except Exception as e:
+                self.logger.error(f"Error in submit_result: {e}")
                 return msgspec.json.encode(
                     RESTSubmitResponse(success=False, error=f"Error submitting result: {str(e)}")
                 )
+
+        @self.rest_app.get("/history")
+        async def get_history():
+            """Endpoint to get optimization history"""
+            try:
+                # Get current status from scheduler
+                self.socket.send(msgspec.json.encode(StatusRequest()))
+                status_response = msgspec.json.decode(self.socket.recv(), type=Message)
+
+                if not isinstance(status_response, StatusResponse):
+                    return {"error": "Failed to get status from scheduler"}
+
+                # Return just the current status information
+                history_data = {
+                    "total_evaluations": status_response.total_evaluations,
+                    "active_workers": status_response.active_workers,
+                    "best_objectives": status_response.best_objectives
+                }
+
+                return {
+                    "history": history_data
+                }
+            except Exception as e:
+                self.logger.error(f"Error handling history request: {e}")
+                return {"error": str(e)}
 
         @self.rest_app.get("/status")
         async def get_status():
@@ -403,16 +469,9 @@ class Server:
                 self.logger.info("Received status request")
 
                 request = StatusRequest()
-                encoded_request = msgspec.json.encode(request)
-                self.logger.info(f"Sending request to scheduler: {encoded_request}")
+                self.socket.send(msgspec.json.encode(request))
 
-                self.socket.send(encoded_request)
-
-                raw_response = self.socket.recv()
-                self.logger.info(f"Received raw response from scheduler: {raw_response}")
-
-                response = msgspec.json.decode(raw_response, type=Message)
-                self.logger.info(f"Decoded response: {response}")
+                response = msgspec.json.decode(self.socket.recv(), type=Message)
 
                 match response:
                     case StatusResponse() as status:
@@ -430,16 +489,80 @@ class Server:
                 self.logger.error(f"Error handling status request: {e}")
                 return {"error": str(e)}
 
+        @self.rest_app.websocket("/ws")
+        async def websocket_endpoint(websocket: WebSocket):
+            await websocket.accept()
+            self.active_connections.append(websocket)
+            self.logger.info(f"WebSocket client connected. Total connections: {len(self.active_connections)}")
+
+            try:
+                # Send initial status to the new client
+                self.socket.send(msgspec.json.encode(StatusRequest()))
+                status_response = msgspec.json.decode(self.socket.recv(), type=Message)
+
+                if isinstance(status_response, StatusResponse):
+                    initial_data = {
+                        "type": "status",
+                        "data": {
+                            "active_workers": status_response.active_workers,
+                            "total_evaluations": status_response.total_evaluations,
+                            "best_objectives": status_response.best_objectives
+                        }
+                    }
+                    await websocket.send_json(initial_data)
+
+                # Keep connection open
+                while True:
+                    # Just keep the connection alive
+                    await websocket.receive_text()
+
+            except WebSocketDisconnect:
+                self.active_connections.remove(websocket)
+                self.logger.info(f"WebSocket client disconnected. Remaining: {len(self.active_connections)}")
+            except Exception as e:
+                self.logger.error(f"WebSocket error: {e}")
+                if websocket in self.active_connections:
+                    self.active_connections.remove(websocket)
+
+    async def broadcast_result(self, result_data: Dict):
+        """Broadcast optimization result to all connected WebSocket clients"""
+        if not self.active_connections:
+            return
+
+        # Format the message
+        message = {
+            "type": "result",
+            "data": result_data
+        }
+
+        # Send to all active connections
+        for connection in self.active_connections.copy():
+            try:
+                await connection.send_json(message)
+            except Exception as e:
+                self.logger.error(f"Error broadcasting to client: {e}")
+                if connection in self.active_connections:
+                    self.active_connections.remove(connection)
+
     def start(self):
         self.running = True
 
-        rest_thread = threading.Thread(
-            target=uvicorn.run,
-            args=(self.rest_app,),
-            kwargs={"host": self.host, "port": self.port, "log_level": "info"},
-        )
-        rest_thread.daemon = True
-        rest_thread.start()
+        def run_server():
+            config = uvicorn.Config(
+                app=self.rest_app,
+                host=self.host,
+                port=self.port,
+                log_level="info"
+            )
+            server = uvicorn.Server(config)
+            try:
+                server.run()
+            except Exception as e:
+                self.logger.error(f"Server error: {e}")
+
+        self.server_thread = threading.Thread(target=run_server)
+        self.server_thread.daemon = True
+        self.server_thread.start()
 
         self.logger.info(f"HTTP server started on http://{self.host}:{self.port}")
 
@@ -447,6 +570,7 @@ class Server:
         self.running = False
         self.socket.close()
         self.context.term()
+        self.logger.info("Server stopped")
 
 
 # ============================================================================
@@ -503,6 +627,9 @@ def shutdown_system(scheduler_process: mp.Process, server: Server, active_worker
 
         logger.info("Stopping server...")
         server.stop()
+
+        # Ensure we're really giving the server time to stop
+        time.sleep(1)
 
         logger.info("Shutdown complete")
 
@@ -565,7 +692,7 @@ if __name__ == "__main__":
                 current_workers = active_workers.value
                 main_logger.info(
                     f"Main loop: {current_workers} active workers, "
-                    f"total evaluations: {coordinator.get_total_evaluations()}"
+                    f"total_evaluations: {coordinator.get_total_evaluations()}"
                 )
                 if current_workers <= 0:
                     main_logger.info("All workers finished")
@@ -574,10 +701,10 @@ if __name__ == "__main__":
 
         # Clean up and report results
         time.sleep(0.5)
-        final_state = coordinator.get_state()
         main_logger.info(f"Optimization completed:")
-        main_logger.info(f"Total evaluations: {final_state.total_evaluations}")
-        main_logger.info(f"Best result: {final_state.best_result}")
+        main_logger.info(f"Total evaluations: {coordinator.get_total_evaluations()}")
+        best_objectives = coordinator.get_best_objectives()
+        main_logger.info(f"Best result: {best_objectives}")
 
         main_logger.info("Initiating final shutdown sequence")
         shutdown_system(scheduler_process, server, active_workers)

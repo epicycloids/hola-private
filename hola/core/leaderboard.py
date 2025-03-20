@@ -131,6 +131,7 @@ class Leaderboard:
         - Parameter values
         - Objective values
         - Comparison group scores
+        - Crowding distance (provides diversity measure within a Pareto front)
 
         Note:
         - Only feasible trials are included in the DataFrame
@@ -146,11 +147,24 @@ class Leaderboard:
         info = {}
         for i, (key, score) in enumerate(self._poset.items()):
             trial = self.get_trial(key)
+
+            # Get crowding distance from the poset
+            crowding_distance = self._poset.get_crowding_distance(key)
+
+            # Handle score properly based on its type
+            score_dict = {}
+            if self._objective_scorer.is_multigroup:
+                score_dict = {f"Group {j} Score": score[j] for j in range(len(score))}
+            else:
+                # If score is a single value (e.g., float)
+                score_dict = {"Group Score": score}
+
             info[i] = {
                 "Trial": key,
+                "Crowding Distance": crowding_distance,
                 **trial.parameters,
                 **trial.objectives,
-                **{f"Group {j} Score": score[j] for j in len(score)},
+                **score_dict,
             }
         return pd.DataFrame(info)
 
@@ -168,56 +182,5 @@ class Leaderboard:
         self._data[index] = trial
         if trial.is_feasible:
             group_values = self._objective_scorer.score(trial.objectives)
-            self._poset.add(index, group_values)
-
-    def update_objective_scorer(self, new_scorer: ObjectiveScorer) -> None:
-        """
-        Update the objective scorer and rebuild the leaderboard.
-
-        This method:
-        1. Preserves all trial data
-        2. Creates a new poset with appropriate type (scalar/vector)
-        3. Re-scores and re-adds all trials using the new scorer
-
-        :param new_scorer: New objective scorer to use
-        :type new_scorer: ObjectiveScorer
-        """
-        old_trials = list(self._data.values())
-        self._data.clear()
-        self._objective_scorer = new_scorer
-        self._poset = (
-            VectorPoset[int]() if self._objective_scorer.is_multigroup else ScalarPoset[int]()
-        )
-        for trial in old_trials:
-            self.add(trial)
-
-    def rebuild_leaderboard(self, param_transformer: ParameterTransformer) -> None:
-        """
-        Rebuild leaderboard after parameter constraints have changed.
-
-        This method:
-        1. Updates feasibility status for all trials
-        2. Creates a new poset of appropriate type
-        3. Re-adds only feasible trials to the poset
-
-        :param param_transformer: Transformer defining parameter constraints
-        :type param_transformer: ParameterTransformer
-        """
-        # Update feasibility for all trials
-        self._data = {
-            idx: msgspec.structs.replace(
-                trial, is_feasible=param_transformer.is_feasible(trial.parameters)
-            )
-            for idx, trial in self._data.items()
-        }
-
-        # Create new poset of appropriate type
-        self._poset = (
-            VectorPoset[int]() if self._objective_scorer.is_multigroup else ScalarPoset[int]()
-        )
-
-        # Add only feasible trials to poset
-        for idx, trial in self._data.items():
-            if trial.is_feasible:
-                group_values = self._objective_scorer.score(trial.objectives)
-                self._poset.add(idx, group_values)
+            if all(group_values < float("inf")):
+                self._poset.add(index, group_values)

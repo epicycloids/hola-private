@@ -23,9 +23,6 @@ from hola.core.utils import MIN_FLOAT_TOLERANCE, FloatArray
 Key = TypeVar("Key", bound=Hashable)
 """Type variable for hashable keys used to identify trials in posets."""
 
-DType = TypeVar("DType", bound=np.generic)
-"""Type variable for numpy data types used in array operations."""
-
 
 class Poset(Protocol[Key]):
     """
@@ -249,6 +246,22 @@ class ScalarPoset(Generic[Key]):
         if k < 1:
             raise ValueError("k must be positive.")
         return list(islice(self.items(), k))
+
+    def get_crowding_distance(self, key: Key) -> float:
+        """
+        Get the crowding distance for a trial.
+
+        In a scalar poset, all items have infinite crowding distance by definition.
+
+        :param key: Trial identifier
+        :type key: Key
+        :return: Always returns infinity for scalar posets
+        :rtype: float
+        :raises KeyError: If key doesn't exist in the poset
+        """
+        if key not in self._scores:
+            raise KeyError(f"Key {key} not in poset.")
+        return float("inf")
 
     # -----------------------------------------------------------------------
     # Internal helpers
