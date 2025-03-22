@@ -177,6 +177,52 @@ class ObjectiveScorer:
             objectives=msgspec.json.decode(json_str, type=dict[ObjectiveName, ObjectiveConfig])
         )
 
+    def save_to_file(self, filepath: str) -> None:
+        """
+        Save the objective scorer configuration to a JSON file.
+
+        This method serializes all objectives and their configurations to a JSON file
+        that can later be loaded back into an ObjectiveScorer.
+
+        :param filepath: Path where the JSON file will be saved
+        :type filepath: str
+        """
+        # Create directory if it doesn't exist
+        import os
+        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+
+        # Encode using msgspec
+        encoded = msgspec.json.encode({"objectives": self.objectives})
+
+        # Write to file
+        with open(filepath, 'wb') as f:
+            f.write(encoded)
+
+    @classmethod
+    def load_from_file(cls, filepath: str) -> "ObjectiveScorer":
+        """
+        Load an objective scorer from a JSON file.
+
+        This class method creates a new ObjectiveScorer instance from a file
+        previously created with save_to_file.
+
+        :param filepath: Path to the JSON file to load
+        :type filepath: str
+        :return: A new ObjectiveScorer instance with the loaded objectives
+        :rtype: ObjectiveScorer
+        :raises FileNotFoundError: If the file doesn't exist
+        """
+        # Check if file exists
+        import os
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"No file found at {filepath}")
+
+        # Load and decode using msgspec
+        with open(filepath, 'rb') as f:
+            data = msgspec.json.decode(f.read(), type=dict[str, dict[ObjectiveName, ObjectiveConfig]])
+
+        return cls(data["objectives"])
+
     def __post_init__(self):
         """
         Initialize group ID mapping and validate configuration.

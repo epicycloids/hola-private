@@ -19,9 +19,13 @@ Trials can be:
 """
 
 from typing import Any, Dict, List, Optional, Union
+import json
+import os
 
 import pandas as pd
 from msgspec import Struct
+import numpy as np
+import msgspec
 
 from hola.core.objectives import ObjectiveName, ObjectiveScorer
 from hola.core.parameters import ParameterName
@@ -374,5 +378,73 @@ class Leaderboard:
         self._data[index] = trial
         if trial.is_feasible:
             group_values = self._objective_scorer.score(trial.objectives)
-            if all(value < float("inf") for value in group_values):
+            if np.all(group_values < float("inf")):
                 self._poset.add(index, group_values)
+
+    def save_to_file(self, filepath: str) -> None:
+        """
+        Save the leaderboard state to a JSON file.
+
+        This method serializes all trials and their data to a JSON file
+        that can later be loaded back into a Leaderboard.
+
+        :param filepath: Path where the JSON file will be saved
+        :type filepath: str
+        """
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+
+        # Create output structure with trials list
+        output = {
+            "trials": list(self._data.values()),
+            "is_multigroup": self._objective_scorer.is_multigroup
+        }
+
+        # Encode and write to file
+        encoded = msgspec.json.encode(output)
+        with open(filepath, 'wb') as f:
+            f.write(encoded)
+
+    @classmethod
+    def load_from_file(cls, filepath: str, objective_scorer: ObjectiveScorer) -> "Leaderboard":
+        """
+        Load a leaderboard from a JSON file.
+
+        This class method creates a new Leaderboard instance from a file
+        previously created with save_to_file.
+
+        :param filepath: Path to the JSON file to load
+        :type filepath: str
+        :param objective_scorer: The objective scorer to use for the loaded leaderboard
+        :type objective_scorer: ObjectiveScorer
+        :return: A new Leaderboard instance with the loaded trials
+        :rtype: Leaderboard
+        :raises FileNotFoundError: If the file doesn't exist
+        :raises ValueError: If there's a mismatch between the file's multigroup setting
+                           and the provided objective_scorer
+        """
+        # Check if file exists
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"No file found at {filepath}")
+
+        # Load and decode data
+        with open(filepath, 'rb') as f:
+            data = msgspec.json.decode(f.read(), type=dict[str, Any])
+
+        # Verify compatibility with the provided objective_scorer
+        if data.get("is_multigroup") != objective_scorer.is_multigroup:
+            raise ValueError(
+                "Mismatch between loaded file and provided objective_scorer. "
+                f"File has is_multigroup={data.get('is_multigroup')}, but "
+                f"objective_scorer has is_multigroup={objective_scorer.is_multigroup}"
+            )
+
+        # Create new leaderboard
+        leaderboard = cls(objective_scorer)
+
+        # Decode trials and add them to the leaderboard
+        trials = msgspec.json.decode(msgspec.json.encode(data["trials"]), type=list[Trial])
+        for trial in trials:
+            leaderboard.add(trial)
+
+        return leaderboard

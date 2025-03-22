@@ -305,6 +305,133 @@ class OptimizationCoordinator:
         """
         return self.leaderboard._objective_scorer.is_multigroup
 
+    def save_to_file(self, filepath: str) -> None:
+        """
+        Save the optimization coordinator state to a JSON file.
+
+        This method saves the complete state of the optimization, including:
+        - Parameter configurations
+        - Objective configurations
+        - All trials data
+        - The state of the sampler
+        - Configuration parameters like top_frac and minimum_fit_samples
+
+        :param filepath: Path where the JSON file will be saved
+        :type filepath: str
+        """
+        import os
+        import json
+
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+
+        # Create temporary directory for component files
+        base_dir = os.path.dirname(filepath)
+        filename = os.path.basename(filepath)
+        name_without_ext = os.path.splitext(filename)[0]
+        temp_dir = os.path.join(base_dir, f"{name_without_ext}_components")
+        os.makedirs(temp_dir, exist_ok=True)
+
+        # Save parameter transformer
+        param_file = os.path.join(temp_dir, "parameters.json")
+        self.parameter_transformer.save_to_file(param_file)
+
+        # Save objective scorer
+        objective_file = os.path.join(temp_dir, "objectives.json")
+        self.leaderboard._objective_scorer.save_to_file(objective_file)
+
+        # Save leaderboard (trials data)
+        leaderboard_file = os.path.join(temp_dir, "leaderboard.json")
+        self.leaderboard.save_to_file(leaderboard_file)
+
+        # Save sampler state
+        sampler_state = self.hypercube_sampler.get_state()
+
+        # Create main config file
+        config = {
+            "top_frac": self.top_frac,
+            "minimum_fit_samples": self.minimum_fit_samples,
+            "sampler_state": sampler_state,
+            "components_dir": temp_dir,
+            "total_evaluations": self.get_total_evaluations(),
+            "timestamp": __import__("datetime").datetime.now().isoformat()
+        }
+
+        # Write main config file
+        with open(filepath, 'w') as f:
+            json.dump(config, f, indent=2)
+
+    @classmethod
+    def load_from_file(cls, filepath: str) -> "OptimizationCoordinator":
+        """
+        Load an optimization coordinator from a JSON file.
+
+        This class method recreates the complete state of the optimization from
+        a file previously created with save_to_file.
+
+        :param filepath: Path to the JSON file to load
+        :type filepath: str
+        :return: A new OptimizationCoordinator with the restored state
+        :rtype: OptimizationCoordinator
+        :raises FileNotFoundError: If the file doesn't exist
+        """
+        import os
+        import json
+        from hola.core.samplers import create_sampler_from_state
+
+        # Check if file exists
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"No file found at {filepath}")
+
+        # Load main config
+        with open(filepath, 'r') as f:
+            config = json.load(f)
+
+        # Get component directory
+        temp_dir = config.get("components_dir")
+        if not os.path.exists(temp_dir):
+            raise FileNotFoundError(f"Component directory not found: {temp_dir}")
+
+        # Load parameter transformer
+        param_file = os.path.join(temp_dir, "parameters.json")
+        parameter_transformer = ParameterTransformer.load_from_file(param_file)
+
+        # Load objective scorer
+        objective_file = os.path.join(temp_dir, "objectives.json")
+        objective_scorer = ObjectiveScorer.load_from_file(objective_file)
+
+        # Create sampler from saved state
+        sampler_state = config.get("sampler_state", {})
+        hypercube_sampler = create_sampler_from_state(sampler_state)
+
+        # Load leaderboard
+        leaderboard_file = os.path.join(temp_dir, "leaderboard.json")
+        leaderboard = Leaderboard.load_from_file(leaderboard_file, objective_scorer)
+
+        # Create coordinator
+        coordinator = cls(
+            hypercube_sampler=hypercube_sampler,
+            leaderboard=leaderboard,
+            parameter_transformer=parameter_transformer,
+            top_frac=config.get("top_frac", 0.2),
+            minimum_fit_samples=config.get("minimum_fit_samples", 20),
+        )
+
+        # Try to fit the sampler with elite samples if we have enough data
+        if coordinator.top_frac * coordinator.leaderboard.get_feasible_count() >= coordinator.minimum_fit_samples:
+            best_trials = coordinator.leaderboard.get_top_k(coordinator.minimum_fit_samples)
+            if best_trials:
+                try:
+                    coordinator.hypercube_sampler.fit(
+                        coordinator.parameter_transformer.normalize(
+                            [trial.parameters for trial in best_trials]
+                        )
+                    )
+                except Exception as e:
+                    print(f"Warning: Failed to fit sampler with elite samples: {str(e)}")
+
+        return coordinator
+
 
 if __name__ == "__main__":
     from hola.core.coordinator import OptimizationCoordinator

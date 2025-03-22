@@ -19,7 +19,7 @@ The normalized space is designed such that:
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Generic, Protocol, TypeAlias, TypeVar, Union, overload, runtime_checkable
+from typing import Any, Generic, Protocol, TypeAlias, TypeVar, Union, overload, runtime_checkable, Dict, Final
 
 import msgspec
 import numpy as np
@@ -27,6 +27,19 @@ import numpy.typing as npt
 from msgspec import Struct
 
 from hola.core.utils import MIN_FLOAT_TOLERANCE, FloatArray, IntArray, uniform_to_category
+
+
+# Permanent tags for parameter types to ensure serialization compatibility
+# if class names change in the future
+PARAMETER_TAGS: Final[Dict[str, str]] = {
+    "continuous": "ContinuousParameterConfig",
+    "categorical": "CategoricalParameterConfig",
+    "integer": "IntegerParameterConfig",
+    "lattice": "LatticeParameterConfig"
+}
+
+# Reverse mapping for lookup
+PARAMETER_CLASSES: Final[Dict[str, str]] = {v: k for k, v in PARAMETER_TAGS.items()}
 
 ParameterName: TypeAlias = str
 """Type alias for parameter names in configuration dictionaries."""
@@ -139,6 +152,30 @@ class BaseParameterConfig(Struct, frozen=True):
                 raise ValueError("All array values must be in [0,1].")
         else:
             raise TypeError(f"Value must be a float or ndarray, got {type(u)}")
+
+    def get_state(self) -> Dict[str, Any]:
+        """
+        Get a serializable representation of the parameter config's state.
+
+        :return: Dictionary containing the parameter config state
+        :rtype: Dict[str, Any]
+        """
+        return {
+            "type": PARAMETER_CLASSES[self.__class__.__name__],
+        }
+
+    @classmethod
+    def create_from_state(cls, state: Dict[str, Any]) -> "ParameterConfig":
+        """
+        Create a parameter config from a serialized state.
+
+        :param state: Dictionary containing the parameter config state
+        :type state: Dict[str, Any]
+        :return: Parameter config instance
+        :rtype: ParameterConfig
+        :raises ValueError: If state is invalid
+        """
+        raise NotImplementedError("Subclasses must implement create_from_state")
 
 
 class ContinuousParameterConfig(BaseParameterConfig, tag="continuous", frozen=True):
@@ -266,6 +303,37 @@ class ContinuousParameterConfig(BaseParameterConfig, tag="continuous", frozen=Tr
 
         return (self.min < old_config.min) or (self.max > old_config.max)
 
+    def get_state(self) -> Dict[str, Any]:
+        """
+        Get a serializable representation of the parameter config's state.
+
+        :return: Dictionary containing the parameter config state
+        :rtype: Dict[str, Any]
+        """
+        state = super().get_state()
+        state.update({
+            "min": self.min,
+            "max": self.max,
+            "scale": self.scale.value
+        })
+        return state
+
+    @classmethod
+    def create_from_state(cls, state: Dict[str, Any]) -> "ContinuousParameterConfig":
+        """
+        Create a continuous parameter config from a serialized state.
+
+        :param state: Dictionary containing the parameter config state
+        :type state: Dict[str, Any]
+        :return: ContinuousParameterConfig instance
+        :rtype: ContinuousParameterConfig
+        """
+        return cls(
+            min=state["min"],
+            max=state["max"],
+            scale=Scale(state.get("scale", "linear"))
+        )
+
 
 class CategoricalParameterConfig(
     BaseParameterConfig, Generic[Category], tag="categorical", frozen=True
@@ -389,6 +457,31 @@ class CategoricalParameterConfig(
             raise TypeError(f"Cannot compare with config of type {type(old_config)}")
         return not set(old_config.categories).issuperset(self.categories)
 
+    def get_state(self) -> Dict[str, Any]:
+        """
+        Get a serializable representation of the parameter config's state.
+
+        :return: Dictionary containing the parameter config state
+        :rtype: Dict[str, Any]
+        """
+        state = super().get_state()
+        state.update({
+            "categories": list(self.categories)
+        })
+        return state
+
+    @classmethod
+    def create_from_state(cls, state: Dict[str, Any]) -> "CategoricalParameterConfig":
+        """
+        Create a categorical parameter config from a serialized state.
+
+        :param state: Dictionary containing the parameter config state
+        :type state: Dict[str, Any]
+        :return: CategoricalParameterConfig instance
+        :rtype: CategoricalParameterConfig
+        """
+        return cls(categories=tuple(state["categories"]))
+
 
 class IntegerParameterConfig(BaseParameterConfig, tag="integer", frozen=True):
     """
@@ -507,6 +600,32 @@ class IntegerParameterConfig(BaseParameterConfig, tag="integer", frozen=True):
         if not isinstance(old_config, IntegerParameterConfig):
             raise TypeError(f"Cannot compare with config of type {type(old_config)}")
         return (self.min < old_config.min) or (self.max > old_config.max)
+
+    def get_state(self) -> Dict[str, Any]:
+        """
+        Get a serializable representation of the parameter config's state.
+
+        :return: Dictionary containing the parameter config state
+        :rtype: Dict[str, Any]
+        """
+        state = super().get_state()
+        state.update({
+            "min": self.min,
+            "max": self.max
+        })
+        return state
+
+    @classmethod
+    def create_from_state(cls, state: Dict[str, Any]) -> "IntegerParameterConfig":
+        """
+        Create an integer parameter config from a serialized state.
+
+        :param state: Dictionary containing the parameter config state
+        :type state: Dict[str, Any]
+        :return: IntegerParameterConfig instance
+        :rtype: IntegerParameterConfig
+        """
+        return cls(min=state["min"], max=state["max"])
 
 
 class LatticeParameterConfig(BaseParameterConfig, tag="lattice", frozen=True):
@@ -644,6 +763,37 @@ class LatticeParameterConfig(BaseParameterConfig, tag="lattice", frozen=True):
             or self.num_values > old_config.num_values
         )
 
+    def get_state(self) -> Dict[str, Any]:
+        """
+        Get a serializable representation of the parameter config's state.
+
+        :return: Dictionary containing the parameter config state
+        :rtype: Dict[str, Any]
+        """
+        state = super().get_state()
+        state.update({
+            "min": self.min,
+            "max": self.max,
+            "num_values": self.num_values
+        })
+        return state
+
+    @classmethod
+    def create_from_state(cls, state: Dict[str, Any]) -> "LatticeParameterConfig":
+        """
+        Create a lattice parameter config from a serialized state.
+
+        :param state: Dictionary containing the parameter config state
+        :type state: Dict[str, Any]
+        :return: LatticeParameterConfig instance
+        :rtype: LatticeParameterConfig
+        """
+        return cls(
+            min=state["min"],
+            max=state["max"],
+            num_values=state["num_values"]
+        )
+
 
 PredefinedParameterConfig: TypeAlias = Union[
     ContinuousParameterConfig,
@@ -695,6 +845,52 @@ class ParameterTransformer:
         """
         configs = msgspec.json.decode(json_str, type=dict[ParameterName, PredefinedParameterConfig])
         return cls(configs)
+
+    def save_to_file(self, filepath: str) -> None:
+        """
+        Save the parameter transformer configuration to a JSON file.
+
+        This method serializes all parameter configurations to a JSON file
+        that can later be loaded back into a ParameterTransformer.
+
+        :param filepath: Path where the JSON file will be saved
+        :type filepath: str
+        """
+        # Create directory if it doesn't exist
+        import os
+        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+
+        # Encode using msgspec
+        encoded = msgspec.json.encode({"parameters": self.parameters})
+
+        # Write to file
+        with open(filepath, 'wb') as f:
+            f.write(encoded)
+
+    @classmethod
+    def load_from_file(cls, filepath: str) -> "ParameterTransformer":
+        """
+        Load a parameter transformer from a JSON file.
+
+        This class method creates a new ParameterTransformer instance from a file
+        previously created with save_to_file.
+
+        :param filepath: Path to the JSON file to load
+        :type filepath: str
+        :return: A new ParameterTransformer instance with the loaded configurations
+        :rtype: ParameterTransformer
+        :raises FileNotFoundError: If the file doesn't exist
+        """
+        # Check if file exists
+        import os
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"No file found at {filepath}")
+
+        # Load and decode using msgspec
+        with open(filepath, 'rb') as f:
+            data = msgspec.json.decode(f.read(), type=dict[str, dict[ParameterName, PredefinedParameterConfig]])
+
+        return cls(data["parameters"])
 
     @property
     def param_names(self) -> list[ParameterName]:
