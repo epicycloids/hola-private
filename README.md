@@ -104,61 +104,32 @@ def evaluate(x: float, y: float) -> dict[str, float]:
     return {"f1": f1, "f2": f2}
 
 # TODO: Run the optimization system
+# Run the optimization for a specified number of iterations
+n_iterations = 100
+for i in range(n_iterations):
+    # Get parameter suggestions
+    params_list, metadata = coordinator.suggest_parameters()
 
-print(f"Best parameters: {result.best_result.parameters}")
-print(f"Best objectives: {result.best_result.objectives}")
+    # Evaluate objectives for each parameter set
+    for params in params_list:
+        objectives = evaluate(**params)
+
+        # Record the evaluation results with metadata
+        coordinator.record_evaluation(params, objectives, metadata)
+
+    # Optional: Print progress update
+    if (i + 1) % 10 == 0:
+        print(f"Completed {i + 1}/{n_iterations} iterations")
+
+    # Get current best trial
+    best_trial = coordinator.get_best_trial()
+    if best_trial:
+        print(f"Current best parameters: {best_trial.parameters}")
+        print(f"Current best objectives: {best_trial.objectives}")
+
+# Get final result
+result = coordinator.get_best_trial()
+
+print(f"Best parameters: {result.parameters}")
+print(f"Best objectives: {result.objectives}")
 ```
-
-## Distributed Mode
-
-HOLA provides a robust distributed optimization system with the following components:
-
-### Architecture
-
-The distributed system consists of three main components:
-
-1. **Scheduler**: Manages parameter suggestion and result collection
-2. **Workers**: Evaluate parameters and report results
-3. **REST API Server**: Provides HTTP access for remote clients
-4. **Monitoring Dashboard**: Visualizes optimization progress
-
-### Communication Protocols
-
-HOLA supports multiple communication protocols:
-
-- **IPC**: For fastest communication between processes on the same machine
-- **TCP**: For network communication between machines
-- **HTTP**: For web-based clients and language-agnostic workers
-
-### Worker Implementation
-
-Workers can be implemented in any language that supports ZMQ or HTTP requests:
-
-- **Python Workers**: Use the built-in `LocalWorker` class
-- **Custom Workers**: Implement the protocol in any language
-
-The worker protocol is simple:
-1. Request parameter suggestions from the server
-2. Evaluate the parameters using your objective function
-3. Submit the results back to the server
-
-### Monitoring
-
-The Streamlit-based dashboard provides real-time monitoring of:
-
-- Number of active workers
-- Total evaluations performed
-- Best objectives found so far
-- Optimization progress over time
-- Historical trial data
-
-## Advanced Features
-
-- **Dynamic reconfiguration**: Update parameter bounds or objective targets during optimization
-- **Leaderboard maintenance**: Track and rank all trials for post-analysis
-- **Custom samplers**: Implement your own sampling strategies
-- **Monitoring and visualization**: Track optimization progress (experimental)
-
-## Status
-
-The core optimization functionality is stable and well-tested. The distributed server mode is functional but still undergoing refinement. The web-based dashboard visualization is currently in experimental status.
