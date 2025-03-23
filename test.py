@@ -1,5 +1,6 @@
 import logging
 import multiprocessing as mp
+import random
 import sys
 import threading
 import time
@@ -11,13 +12,14 @@ from typing import Any, Callable, List, Dict, Optional, Tuple, Union
 import msgspec
 import uvicorn
 import zmq
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request
 from msgspec import Struct
 
 from hola.core.coordinator import OptimizationCoordinator
 from hola.core.objectives import ObjectiveName
 from hola.core.parameters import ParameterName
 from hola.core.samplers import SobolSampler
+from hola.core.leaderboard import Trial
 
 # ============================================================================
 # Logging Setup
@@ -73,6 +75,10 @@ class SubmitResultRequest(Struct, tag="submit_result"):
     result: Result
 
 
+class HeartbeatRequest(Struct, tag="heartbeat"):
+    worker_id: int
+
+
 class ShutdownRequest(Struct, tag="shutdown"):
     pass
 
@@ -108,6 +114,10 @@ class SubmitResultResponse(Struct, tag="result_response"):
     error: str | None = None
 
 
+class HeartbeatResponse(Struct, tag="heartbeat_response"):
+    success: bool
+
+
 class StatusResponse(Struct, tag="status_response"):
     active_workers: int
     total_evaluations: int
@@ -134,6 +144,7 @@ class IsMultiGroupResponse(Struct, tag="multi_group_response"):
 Message = (
     GetSuggestionRequest
     | SubmitResultRequest
+    | HeartbeatRequest
     | ShutdownRequest
     | StatusRequest
     | GetTrialsRequest
@@ -142,6 +153,7 @@ Message = (
     | IsMultiGroupRequest
     | GetSuggestionResponse
     | SubmitResultResponse
+    | HeartbeatResponse
     | StatusResponse
     | GetTrialsResponse
     | GetMetadataResponse
@@ -155,36 +167,118 @@ Message = (
 # ============================================================================
 
 
+class WorkerState:
+    """Class to track the state of a worker."""
+    def __init__(self, worker_id: int):
+        self.worker_id = worker_id
+        self.current_parameters: Optional[dict[ParameterName, Any]] = None
+        self.start_time: Optional[float] = None
+        self.last_heartbeat: float = time.time()
+        self.retry_count: int = 0
+
+    def assign_parameters(self, parameters: dict[ParameterName, Any]):
+        """Assign parameters to this worker."""
+        self.current_parameters = parameters
+        self.start_time = time.time()
+        self.last_heartbeat = time.time()
+
+    def update_heartbeat(self):
+        """Update the last heartbeat time."""
+        self.last_heartbeat = time.time()
+
+    def is_timed_out(self, timeout_seconds: float) -> bool:
+        """Check if the worker has timed out."""
+        if self.start_time is None:
+            return False
+        return (time.time() - self.last_heartbeat) > timeout_seconds
+
+
 class SchedulerProcess:
     """Central scheduler that coordinates optimization trials and worker assignments."""
 
-    def __init__(self, coordinator: OptimizationCoordinator):
+    def __init__(self, coordinator: OptimizationCoordinator, max_retries: int = 3, worker_timeout_seconds: float = 300.0):
         self.coordinator = coordinator
         self.running: bool = False
-        self.active_workers: Synchronized[int] = mp.Value(
-            "i", 0
-        )  # Shared counter for active workers
         self.logger = setup_logging("Scheduler")
+        # Set log level for less verbosity
+        self.logger.setLevel(logging.INFO)
         # Track results for faster state retrieval
         self.result_history: List[Result] = []
 
+        # Worker management
+        self.workers: Dict[int, WorkerState] = {}
+        self.max_retries: int = max_retries
+        self.worker_timeout_seconds: float = worker_timeout_seconds
+        self.retry_queue: List[dict[ParameterName, Any]] = []
+
+        # Start timeout checker thread
+        self.timeout_checker_thread = None
+
+        # Worker ID tracking - helps ensure uniqueness
+        self.last_seen_worker_ids = set()
+
+        # For tracking the current best objective values
+        self.best_objectives = None
+
     def run(self):
-        context: zmq.Context = zmq.Context()
-        socket: zmq.Socket = context.socket(zmq.REP)
-        socket.setsockopt(zmq.LINGER, 0)  # Prevents hanging on context termination
+        # Create context and main socket
+        context = zmq.Context()
+        main_socket = context.socket(zmq.REP)
+        main_socket.setsockopt(zmq.LINGER, 0)  # Prevents hanging on context termination
+        main_socket.bind("ipc:///tmp/scheduler.ipc")
+        main_socket.bind("tcp://*:5555")
 
-        socket.bind("ipc:///tmp/scheduler.ipc")
-        socket.bind("tcp://*:5555")
+        # Create separate socket for heartbeats
+        heartbeat_socket = context.socket(zmq.REP)
+        heartbeat_socket.setsockopt(zmq.LINGER, 0)
+        heartbeat_socket.bind("ipc:///tmp/scheduler_heartbeat.ipc")
+        heartbeat_socket.bind("tcp://*:5556")
 
+        # Create poller for both sockets
         poller = zmq.Poller()
-        poller.register(socket, zmq.POLLIN)
+        poller.register(main_socket, zmq.POLLIN)
+        poller.register(heartbeat_socket, zmq.POLLIN)
 
         self.running = True
+
+        # Start timeout checker thread
+        self.timeout_checker_thread = threading.Thread(target=self.check_worker_timeouts)
+        self.timeout_checker_thread.daemon = True
+        self.timeout_checker_thread.start()
+
         while self.running:
             try:
-                # Poll with timeout
-                if poller.poll(100):  # 100ms timeout
-                    message_bytes = socket.recv()
+                # Poll with timeout - check both sockets
+                socks = dict(poller.poll(100))  # 100ms timeout
+
+                # Handle heartbeat messages
+                if heartbeat_socket in socks and socks[heartbeat_socket] == zmq.POLLIN:
+                    message_bytes = heartbeat_socket.recv()
+                    try:
+                        message = msgspec.json.decode(message_bytes, type=Message)
+
+                        if isinstance(message, HeartbeatRequest):
+                            worker_id = message.worker_id
+
+                            if worker_id in self.workers:
+                                self.workers[worker_id].update_heartbeat()
+                                self.logger.debug(f"Received heartbeat from worker {worker_id}")
+                                heartbeat_socket.send(msgspec.json.encode(HeartbeatResponse(success=True)))
+                            else:
+                                # Worker not recognized - might have been removed due to timeout
+                                self.logger.warning(f"Heartbeat from unknown worker {worker_id}")
+                                heartbeat_socket.send(msgspec.json.encode(HeartbeatResponse(success=False)))
+                        else:
+                            # Not a heartbeat message
+                            self.logger.warning(f"Received non-heartbeat message on heartbeat socket: {type(message)}")
+                            heartbeat_socket.send(msgspec.json.encode({"error": "Expected heartbeat message"}))
+                    except Exception as e:
+                        self.logger.error(f"Error processing heartbeat: {e}")
+                        heartbeat_socket.send(msgspec.json.encode({"error": str(e)}))
+
+                # Handle main messages
+                if main_socket in socks and socks[main_socket] == zmq.POLLIN:
+                    message_bytes = main_socket.recv()
                     try:
                         message = msgspec.json.decode(message_bytes, type=Message)
                     except ValueError:
@@ -218,28 +312,74 @@ class SchedulerProcess:
                                 message = IsMultiGroupRequest()
                             else:
                                 # Unknown message type, reply with error
-                                socket.send(msgspec.json.encode({"error": f"Unknown message type: {tag}"}))
+                                main_socket.send(msgspec.json.encode({"error": f"Unknown message type: {tag}"}))
                                 continue
                         except Exception as e:
                             self.logger.error(f"Failed to parse message: {e}")
-                            socket.send(msgspec.json.encode({"error": f"Failed to parse message: {str(e)}"}))
+                            main_socket.send(msgspec.json.encode({"error": f"Failed to parse message: {str(e)}"}))
                             continue
 
                     match message:
                         case GetSuggestionRequest():
-                            params = self.suggest_parameters()
+                            # Register or update worker state
+                            worker_id = message.worker_id
+
+                            # Validate worker ID
+                            if worker_id == 0:  # Only reject worker ID 0, allow negative IDs for REST API
+                                self.logger.warning(f"Received invalid worker ID: {worker_id}")
+                                main_socket.send(msgspec.json.encode(GetSuggestionResponse(parameters=None)))
+                                continue
+
+                            # Track and log new workers
+                            if worker_id not in self.last_seen_worker_ids:
+                                self.last_seen_worker_ids.add(worker_id)
+                                self.logger.info(f"First contact from worker {worker_id}")
+
+                            if worker_id not in self.workers:
+                                self.workers[worker_id] = WorkerState(worker_id)
+                                self.logger.info(f"New worker registered: {worker_id}. Total active workers: {len(self.workers)}")
+                            else:
+                                self.workers[worker_id].update_heartbeat()
+
+                            # Check retry queue first
+                            params = None
+                            if self.retry_queue:
+                                params = self.retry_queue.pop(0)
+                                self.logger.info(f"Assigning retry parameters to worker {worker_id}: {params}")
+                            else:
+                                params = self.suggest_parameters()
+
+                            if params:
+                                self.workers[worker_id].assign_parameters(params)
+
                             response = GetSuggestionResponse(parameters=params)
-                            socket.send(msgspec.json.encode(response))
+                            main_socket.send(msgspec.json.encode(response))
 
                         case SubmitResultRequest():
-                            is_best = self.register_completed(message.result)
-                            # Add is_best flag to the response
-                            response = SubmitResultResponse(success=True, is_best=is_best)
-                            socket.send(msgspec.json.encode(response))
+                            worker_id = message.worker_id
+                            if worker_id in self.workers:
+                                # Clear worker's current task
+                                worker_state = self.workers[worker_id]
+                                worker_state.current_parameters = None
+                                worker_state.update_heartbeat()
+                                worker_state.retry_count = 0  # Reset retry count on successful submission
+
+                                is_best = self.register_completed(message.result)
+                                # Add is_best flag to the response
+                                response = SubmitResultResponse(success=True, is_best=is_best)
+                            else:
+                                # Worker not recognized
+                                self.logger.warning(f"Result submitted from unknown worker {worker_id}")
+                                response = SubmitResultResponse(
+                                    success=False,
+                                    error="Worker not recognized"
+                                )
+
+                            main_socket.send(msgspec.json.encode(response))
 
                         case ShutdownRequest():
                             self.running = False
-                            socket.send(msgspec.json.encode(SubmitResultResponse(success=True)))
+                            main_socket.send(msgspec.json.encode(SubmitResultResponse(success=True)))
 
                         case StatusRequest():
                             try:
@@ -247,19 +387,19 @@ class SchedulerProcess:
                                 best_objectives = best_trial.objectives if best_trial else None
 
                                 response = StatusResponse(
-                                    active_workers=self.active_workers.value,
+                                    active_workers=len(self.workers),
                                     total_evaluations=self.coordinator.get_total_evaluations(),
                                     best_objectives=best_objectives
                                 )
-                                socket.send(msgspec.json.encode(response))
+                                main_socket.send(msgspec.json.encode(response))
                             except Exception as e:
                                 self.logger.error(f"Error creating status response: {e}")
                                 error_response = StatusResponse(
-                                    active_workers=self.active_workers.value,
+                                    active_workers=len(self.workers),
                                     total_evaluations=0,
                                     best_objectives=None
                                 )
-                                socket.send(msgspec.json.encode(error_response))
+                                main_socket.send(msgspec.json.encode(error_response))
 
                         case GetTrialsRequest():
                             try:
@@ -271,10 +411,10 @@ class SchedulerProcess:
                                 # Convert DataFrame to list of dicts
                                 trials_list = df.reset_index().to_dict(orient="records")
                                 response = GetTrialsResponse(trials=trials_list)
-                                socket.send(msgspec.json.encode(response))
+                                main_socket.send(msgspec.json.encode(response))
                             except Exception as e:
                                 self.logger.error(f"Error getting trials: {e}")
-                                socket.send(msgspec.json.encode(
+                                main_socket.send(msgspec.json.encode(
                                     GetTrialsResponse(trials=[])
                                 ))
 
@@ -291,10 +431,10 @@ class SchedulerProcess:
                                     metadata_list.append(metadata_dict)
 
                                 response = GetMetadataResponse(metadata=metadata_list)
-                                socket.send(msgspec.json.encode(response))
+                                main_socket.send(msgspec.json.encode(response))
                             except Exception as e:
                                 self.logger.error(f"Error getting metadata: {e}")
-                                socket.send(msgspec.json.encode(
+                                main_socket.send(msgspec.json.encode(
                                     GetMetadataResponse(metadata=[])
                                 ))
 
@@ -314,10 +454,10 @@ class SchedulerProcess:
                                     trial_dicts.append(trial_dict)
 
                                 response = GetTopKResponse(trials=trial_dicts)
-                                socket.send(msgspec.json.encode(response))
+                                main_socket.send(msgspec.json.encode(response))
                             except Exception as e:
                                 self.logger.error(f"Error getting top k trials: {e}")
-                                socket.send(msgspec.json.encode(
+                                main_socket.send(msgspec.json.encode(
                                     GetTopKResponse(trials=[])
                                 ))
 
@@ -325,28 +465,60 @@ class SchedulerProcess:
                             try:
                                 is_multi = self.coordinator.is_multi_group()
                                 response = IsMultiGroupResponse(is_multi_group=is_multi)
-                                socket.send(msgspec.json.encode(response))
+                                main_socket.send(msgspec.json.encode(response))
                             except Exception as e:
                                 self.logger.error(f"Error checking multi group: {e}")
-                                socket.send(msgspec.json.encode(
+                                main_socket.send(msgspec.json.encode(
                                     IsMultiGroupResponse(is_multi_group=False)
                                 ))
 
                         case _:
                             self.logger.error(f"Unknown message type: {type(message)}")
-                            socket.send(msgspec.json.encode({"error": f"Unknown message type: {type(message)}"}))
+                            main_socket.send(msgspec.json.encode({"error": f"Unknown message type: {type(message)}"}))
 
             except Exception as e:
                 self.logger.error(f"Scheduler error: {e}")
                 try:
-                    socket.send(msgspec.json.encode({"error": str(e)}))
+                    # If we're handling the main socket, respond there
+                    if 'main_socket' in locals() and 'message' in locals():
+                        main_socket.send(msgspec.json.encode({"error": str(e)}))
                 except:
                     pass
 
         self.logger.info("Scheduler cleaning up...")
-        socket.close()
+        main_socket.close()
+        heartbeat_socket.close()
         context.term()
         self.logger.info("Scheduler shutdown complete")
+
+    def check_worker_timeouts(self):
+        """Background thread to check for timed out workers."""
+        while self.running:
+            try:
+                current_time = time.time()
+                timed_out_workers = []
+
+                for worker_id, worker_state in self.workers.items():
+                    if worker_state.is_timed_out(self.worker_timeout_seconds):
+                        timed_out_workers.append(worker_id)
+                        # Queue parameters for retry if they exist and haven't exceeded max retries
+                        if worker_state.current_parameters is not None:
+                            if worker_state.retry_count < self.max_retries:
+                                self.logger.info(f"Worker {worker_id} timed out. Queueing parameters for retry: {worker_state.current_parameters}")
+                                self.retry_queue.append(worker_state.current_parameters)
+                                worker_state.retry_count += 1
+                            else:
+                                self.logger.warning(f"Parameters from worker {worker_id} exceeded max retries: {worker_state.current_parameters}")
+
+                # Remove timed out workers
+                for worker_id in timed_out_workers:
+                    self.logger.info(f"Removing timed out worker: {worker_id}")
+                    del self.workers[worker_id]
+
+                time.sleep(10)  # Check every 10 seconds
+            except Exception as e:
+                self.logger.error(f"Error in timeout checker: {e}")
+                time.sleep(30)  # Wait longer on error
 
     def suggest_parameters(self) -> dict[ParameterName, Any] | None:
         suggestions, _ = self.coordinator.suggest_parameters(n_samples=1)
@@ -359,22 +531,42 @@ class SchedulerProcess:
         # Add to history
         self.result_history.append(result)
 
-        # Record in coordinator
-        trial = self.coordinator.record_evaluation(
+        # Get the current best trial before adding the new one
+        previous_best = self.coordinator.get_best_trial()
+        previous_best_objectives = previous_best.objectives if previous_best else None
+
+        # Record the new evaluation in the coordinator
+        self.coordinator.record_evaluation(
             result.parameters,
             result.objectives,
             metadata={"source": "worker"}
         )
 
-        # Check if this is the best trial
-        best_trial = self.coordinator.get_best_trial()
-        is_best = best_trial is not None and best_trial.trial_id == trial.trial_id if trial else False
+        # Get the current best trial after adding the new one
+        current_best = self.coordinator.get_best_trial()
 
-        self.logger.info(
-            f"Trial completed: objectives={result.objectives}, "
-            f"total_evaluations={self.coordinator.get_total_evaluations()}, "
-            f"is_best={is_best}"
-        )
+        # Determine if this is the new best trial
+        is_best = False
+        if previous_best is None:
+            # If there was no previous best, this is the best by default
+            is_best = True
+        elif current_best.trial_id != previous_best.trial_id:
+            # The best trial ID changed, so this must be the new best
+            is_best = True
+
+        # Only log at INFO level if it's the best result, otherwise debug
+        if is_best:
+            self.logger.info(
+                f"Best trial found: objectives={result.objectives}, "
+                f"total_evaluations={self.coordinator.get_total_evaluations()}"
+            )
+            # Update our tracked best objectives
+            self.best_objectives = current_best.objectives
+        else:
+            self.logger.debug(
+                f"Trial completed: objectives={result.objectives}, "
+                f"total_evaluations={self.coordinator.get_total_evaluations()}"
+            )
 
         return is_best
 
@@ -390,67 +582,138 @@ class LocalWorker:
     def __init__(
         self,
         worker_id: int,
-        active_workers: Synchronized,
         evaluation_fn: Callable[..., dict[ObjectiveName, float]],
         use_ipc: bool = True,
+        heartbeat_interval: float = 2.0,
     ):
         self.worker_id = worker_id
-        self.active_workers = active_workers
         self.evaluation_fn = evaluation_fn  # Store the evaluation function
-        self.address = "ipc:///tmp/scheduler.ipc" if use_ipc else "tcp://localhost:5555"
+        self.base_address = "ipc:///tmp/scheduler" if use_ipc else "tcp://localhost:555"
+        self.main_address = f"{self.base_address}.ipc" if use_ipc else f"{self.base_address}5"
+        self.heartbeat_address = f"{self.base_address}_heartbeat.ipc" if use_ipc else f"{self.base_address}6"
         self.logger = setup_logging(f"Worker-{worker_id}")
+        self.running = True
+        self.heartbeat_interval = heartbeat_interval
+        self.heartbeat_thread = None
+        # Lock for thread safety
+        self.lock = threading.Lock()
 
     def run(self):
         context = zmq.Context()
         socket = context.socket(zmq.REQ)
         socket.setsockopt(zmq.LINGER, 0)
-        socket.connect(self.address)
+        socket.connect(self.main_address)
 
-        self.logger.info(f"Started worker {self.worker_id} using {self.address}")
+        self.logger.info(f"Started worker {self.worker_id} using {self.main_address}")
 
-        with self.active_workers.get_lock():
-            self.active_workers.value += 1
-            self.logger.info(
-                f"Worker {self.worker_id} registered. Active workers: {self.active_workers.value}"
-            )
+        # Start heartbeat thread
+        self.heartbeat_thread = threading.Thread(target=self.send_heartbeats)
+        self.heartbeat_thread.daemon = True
+        self.heartbeat_thread.start()
 
         try:
-            while True:
-                request = GetSuggestionRequest(worker_id=self.worker_id)
-                socket.send(msgspec.json.encode(request))
+            while self.running:
+                with self.lock:  # Use lock to prevent race conditions
+                    request = GetSuggestionRequest(worker_id=self.worker_id)
+                    socket.send(msgspec.json.encode(request))
 
-                response = msgspec.json.decode(socket.recv(), type=Message)
+                    # Set a timeout for receiving the response
+                    poller = zmq.Poller()
+                    poller.register(socket, zmq.POLLIN)
+
+                    if poller.poll(10000):  # 10 second timeout
+                        response = msgspec.json.decode(socket.recv(), type=Message)
+                    else:
+                        self.logger.warning(f"Worker {self.worker_id}: Response timeout, retrying...")
+                        continue
+
                 match response:
                     case GetSuggestionResponse(parameters=None):
                         self.logger.info(
                             f"Worker {self.worker_id}: No more parameter suggestions available"
                         )
-                        return
+                        self.running = False
+                        break
 
                     case GetSuggestionResponse(parameters=params):
-                        result = self.evaluate_parameters(params)
-                        request = SubmitResultRequest(worker_id=self.worker_id, result=result)
-                        socket.send(msgspec.json.encode(request))
+                        try:
+                            result = self.evaluate_parameters(params)
 
-                        response = msgspec.json.decode(socket.recv(), type=Message)
-                        match response:
-                            case SubmitResultResponse(success=True):
-                                pass
-                            case SubmitResultResponse(success=False, error=error):
-                                self.logger.error(f"Error submitting result: {error}")
+                            with self.lock:  # Use lock again
+                                request = SubmitResultRequest(worker_id=self.worker_id, result=result)
+                                socket.send(msgspec.json.encode(request))
+
+                                # Set a timeout for receiving the response
+                                if poller.poll(10000):  # 10 second timeout
+                                    response = msgspec.json.decode(socket.recv(), type=Message)
+                                else:
+                                    self.logger.warning(f"Worker {self.worker_id}: Result submission timeout")
+                                    continue
+
+                            match response:
+                                case SubmitResultResponse(success=True, is_best=is_best):
+                                    if is_best:
+                                        self.logger.info(f"Worker {self.worker_id}: Found new best result!")
+                                case SubmitResultResponse(success=False, error=error):
+                                    self.logger.error(f"Error submitting result: {error}")
+                        except Exception as e:
+                            self.logger.error(f"Error during evaluation: {e}")
+                            # We'll let the heartbeat mechanism handle this failure
 
         except Exception as e:
             self.logger.error(f"Worker {self.worker_id} error: {e}")
         finally:
-            with self.active_workers.get_lock():
-                self.active_workers.value -= 1
-                self.logger.info(
-                    f"Worker {self.worker_id} deregistered. Active workers: {self.active_workers.value}"
-                )
-
+            self.running = False
             socket.close()
             context.term()
+
+            # Wait for heartbeat thread to complete
+            if self.heartbeat_thread and self.heartbeat_thread.is_alive():
+                self.heartbeat_thread.join(timeout=1.0)
+
             self.logger.info(f"Worker {self.worker_id} shutdown complete")
+
+    def send_heartbeats(self):
+        """Send regular heartbeats to the scheduler."""
+        # Create a separate socket for heartbeats
+        context = zmq.Context()
+        socket = context.socket(zmq.REQ)
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.connect(self.heartbeat_address)
+
+        self.logger.info(f"Worker {self.worker_id}: Started heartbeat thread using {self.heartbeat_address}")
+
+        while self.running:
+            try:
+                time.sleep(self.heartbeat_interval)
+                if not self.running:
+                    break
+
+                request = HeartbeatRequest(worker_id=self.worker_id)
+                socket.send(msgspec.json.encode(request))
+
+                # Set a timeout for receiving the response
+                poller = zmq.Poller()
+                poller.register(socket, zmq.POLLIN)
+
+                if poller.poll(5000):  # 5 second timeout
+                    response = msgspec.json.decode(socket.recv(), type=Message)
+                    if not isinstance(response, HeartbeatResponse) or not response.success:
+                        self.logger.warning(f"Worker {self.worker_id}: Received invalid heartbeat response")
+                else:
+                    self.logger.warning(f"Worker {self.worker_id}: Heartbeat response timeout")
+                    # Recreate socket on timeout
+                    socket.close()
+                    socket = context.socket(zmq.REQ)
+                    socket.setsockopt(zmq.LINGER, 0)
+                    socket.connect(self.heartbeat_address)
+            except Exception as e:
+                self.logger.error(f"Worker {self.worker_id}: Heartbeat error: {e}")
+                time.sleep(10)  # Wait longer on error
+
+        socket.close()
+        context.term()
+        self.logger.info(f"Worker {self.worker_id}: Heartbeat thread stopped")
 
     def evaluate_parameters(self, params: dict[ParameterName, Any]) -> Result:
         self.logger.info(f"Worker {self.worker_id} processing parameters {params}")
@@ -505,11 +768,10 @@ class Server:
     """HTTP server providing REST API access to the optimization system."""
 
     def __init__(
-        self, host: str = "localhost", port: int = 8000, active_workers: Synchronized | None = None
+        self, host: str = "localhost", port: int = 8000
     ):
         self.host = host
         self.port = port
-        self.active_workers = active_workers
 
         self.context: zmq.Context = zmq.Context()
         self.socket: zmq.Socket = self.context.socket(zmq.REQ)
@@ -517,9 +779,6 @@ class Server:
 
         self.rest_app = FastAPI()
         self.setup_rest_routes()
-
-        # WebSocket connections manager for clients
-        self.active_connections: List[WebSocket] = []
 
         self.running: bool = False
         self.logger = setup_logging("Server")
@@ -531,7 +790,10 @@ class Server:
         @self.rest_app.get("/suggestion", response_model=None)
         async def get_job() -> bytes:
             try:
-                request = GetSuggestionRequest(worker_id=-1)
+                # Assign a unique negative worker ID for REST API clients
+                # (to distinguish from local workers which have positive IDs)
+                worker_id = -int(time.time() % 100000)
+                request = GetSuggestionRequest(worker_id=worker_id)
                 self.socket.send(msgspec.json.encode(request))
 
                 response = msgspec.json.decode(self.socket.recv(), type=Message)
@@ -557,9 +819,10 @@ class Server:
                 body = await request.body()
                 result = msgspec.json.decode(body, type=RESTSubmitResult)
 
-                # Create result request
+                # Create result request with a unique negative worker ID
+                worker_id = -int(time.time() % 100000)
                 result_obj = Result(parameters=result.parameters, objectives=result.objectives)
-                request = SubmitResultRequest(worker_id=-1, result=result_obj)
+                request = SubmitResultRequest(worker_id=worker_id, result=result_obj)
                 self.socket.send(msgspec.json.encode(request))
 
                 # Get response from scheduler
@@ -567,26 +830,6 @@ class Server:
 
                 match response:
                     case SubmitResultResponse(success=success, is_best=is_best, error=error):
-                        # If successful, get current state to broadcast to clients
-                        if success:
-                            # Request current status to get total_evaluations and active_workers
-                            self.socket.send(msgspec.json.encode(StatusRequest()))
-                            status_response = msgspec.json.decode(self.socket.recv(), type=Message)
-
-                            if isinstance(status_response, StatusResponse):
-                                # Create result data for clients
-                                result_data = {
-                                    "parameters": result.parameters,
-                                    "objectives": result.objectives,
-                                    "is_best": is_best,
-                                    "active_workers": status_response.active_workers,
-                                    "total_evaluations": status_response.total_evaluations
-                                }
-
-                                # Broadcast to WebSocket clients
-                                if self.active_connections:
-                                    asyncio.create_task(self.broadcast_result(result_data))
-
                         return msgspec.json.encode(RESTSubmitResponse(success=success, error=error))
                     case _:
                         return msgspec.json.encode(
@@ -652,61 +895,6 @@ class Server:
                 self.logger.error(f"Error handling status request: {e}")
                 return {"error": str(e)}
 
-        @self.rest_app.websocket("/ws")
-        async def websocket_endpoint(websocket: WebSocket):
-            await websocket.accept()
-            self.active_connections.append(websocket)
-            self.logger.info(f"WebSocket client connected. Total connections: {len(self.active_connections)}")
-
-            try:
-                # Send initial status to the new client
-                self.socket.send(msgspec.json.encode(StatusRequest()))
-                status_response = msgspec.json.decode(self.socket.recv(), type=Message)
-
-                if isinstance(status_response, StatusResponse):
-                    initial_data = {
-                        "type": "status",
-                        "data": {
-                            "active_workers": status_response.active_workers,
-                            "total_evaluations": status_response.total_evaluations,
-                            "best_objectives": status_response.best_objectives
-                        }
-                    }
-                    await websocket.send_json(initial_data)
-
-                # Keep connection open
-                while True:
-                    # Just keep the connection alive
-                    await websocket.receive_text()
-
-            except WebSocketDisconnect:
-                self.active_connections.remove(websocket)
-                self.logger.info(f"WebSocket client disconnected. Remaining: {len(self.active_connections)}")
-            except Exception as e:
-                self.logger.error(f"WebSocket error: {e}")
-                if websocket in self.active_connections:
-                    self.active_connections.remove(websocket)
-
-    async def broadcast_result(self, result_data: Dict):
-        """Broadcast optimization result to all connected WebSocket clients"""
-        if not self.active_connections:
-            return
-
-        # Format the message
-        message = {
-            "type": "result",
-            "data": result_data
-        }
-
-        # Send to all active connections
-        for connection in self.active_connections.copy():
-            try:
-                await connection.send_json(message)
-            except Exception as e:
-                self.logger.error(f"Error broadcasting to client: {e}")
-                if connection in self.active_connections:
-                    self.active_connections.remove(connection)
-
     def start(self):
         self.running = True
 
@@ -743,16 +931,15 @@ class Server:
 
 def spawn_local_worker(
     worker_id: int,
-    active_workers: Synchronized,
     evaluation_fn: Callable[..., dict[ObjectiveName, str]],
     use_ipc: bool = True,
 ):
     """Spawn a new worker process."""
-    worker = LocalWorker(worker_id, active_workers, evaluation_fn, use_ipc)
+    worker = LocalWorker(worker_id, evaluation_fn, use_ipc)
     worker.run()
 
 
-def shutdown_system(scheduler_process: mp.Process, server: Server, active_workers: Synchronized):
+def shutdown_system(scheduler_process: mp.Process, server: Server):
     """Gracefully shutdown all system components."""
     logger = setup_logging("Shutdown")
     logger.info("Initiating shutdown...")
@@ -804,7 +991,6 @@ def shutdown_system(scheduler_process: mp.Process, server: Server, active_worker
 if __name__ == "__main__":
     # Setup logging
     main_logger = setup_logging("Main")
-    active_workers = mp.Value("i", 0)
 
     # Create and configure OptimizationCoordinator
     hypercube_sampler = SobolSampler(dimension=2)
@@ -822,19 +1008,26 @@ if __name__ == "__main__":
 
     # Example evaluation function
     def example_evaluation_fn(param1: float, param2: float) -> dict[str, float]:
+        # Add some random sleep to simulate work and occasional timeouts
+        duration = random.uniform(0.1, 1.5)
+        # Simulate worker crash occasionally
+        if random.random() < 0.05:  # 5% chance of "crash"
+            main_logger.info(f"Simulating worker crash (sleeping for 10 seconds)")
+            time.sleep(10)
+
+        time.sleep(duration)
         objective1 = param1 + param2
         return {"objective1": objective1}
 
     # Initialize and start system components
-    scheduler = SchedulerProcess(coordinator)
-    scheduler.active_workers = active_workers
+    scheduler = SchedulerProcess(coordinator, max_retries=2, worker_timeout_seconds=5.0)
     scheduler_process = mp.Process(target=scheduler.run)
     scheduler_process.start()
 
     time.sleep(0.5)  # Give scheduler time to start
 
     # Initialize and start server
-    server = Server(active_workers=active_workers)
+    server = Server()
     server.start()
 
     # Start workers
@@ -843,41 +1036,78 @@ if __name__ == "__main__":
     for i in range(num_workers):
         use_ipc = i < num_workers // 2
         p = mp.Process(
-            target=spawn_local_worker, args=(i, active_workers, example_evaluation_fn, use_ipc)
+            target=spawn_local_worker, args=(i, example_evaluation_fn, use_ipc)
         )
         p.start()
         processes.append(p)
 
     # Main loop and shutdown handling
     try:
-        while True:
-            with active_workers.get_lock():
-                current_workers = active_workers.value
-                main_logger.info(
-                    f"Main loop: {current_workers} active workers, "
-                    f"total_evaluations: {coordinator.get_total_evaluations()}"
-                )
-                if current_workers <= 0:
-                    main_logger.info("All workers finished")
-                    break
+        # Poll scheduler for status
+        status_socket = zmq.Context().socket(zmq.REQ)
+        status_socket.connect("ipc:///tmp/scheduler.ipc")
+
+        start_time = time.time()
+        max_runtime = 60  # Run for at most 60 seconds
+
+        while time.time() - start_time < max_runtime:
+            # Request status from scheduler
+            status_socket.send(msgspec.json.encode(StatusRequest()))
+
+            if status_socket.poll(1000, zmq.POLLIN):
+                status_response = msgspec.json.decode(status_socket.recv(), type=Message)
+
+                if isinstance(status_response, StatusResponse):
+                    current_workers = status_response.active_workers
+                    total_evaluations = status_response.total_evaluations
+                    main_logger.info(
+                        f"Main loop: {current_workers} active workers, "
+                        f"total_evaluations: {total_evaluations}, "
+                        f"time elapsed: {time.time() - start_time:.1f}s"
+                    )
+
+                    # End early if we've done enough evaluations
+                    if total_evaluations >= 50:
+                        main_logger.info("Reached target number of evaluations")
+                        break
+            else:
+                main_logger.warning("Status request timeout")
+
             time.sleep(1)
 
         # Clean up and report results
         time.sleep(0.5)
         main_logger.info(f"Optimization completed:")
-        main_logger.info(f"Total evaluations: {coordinator.get_total_evaluations()}")
-        best_objectives = coordinator.get_best_objectives()
-        main_logger.info(f"Best result: {best_objectives}")
+
+        # Request final status using the existing socket
+        status_socket.send(msgspec.json.encode(StatusRequest()))
+        if status_socket.poll(5000):  # 5 second timeout
+            status_response = msgspec.json.decode(status_socket.recv(), type=Message)
+
+            if isinstance(status_response, StatusResponse):
+                main_logger.info(f"Total evaluations: {status_response.total_evaluations}")
+                main_logger.info(f"Best result: {status_response.best_objectives}")
+            else:
+                main_logger.error(f"Unexpected response type when requesting final status")
+        else:
+            main_logger.error("Timeout when requesting final status")
+
+        status_socket.close()
 
         main_logger.info("Initiating final shutdown sequence")
-        shutdown_system(scheduler_process, server, active_workers)
+        shutdown_system(scheduler_process, server)
 
     except KeyboardInterrupt:
         main_logger.info("\nReceived interrupt signal")
-        shutdown_system(scheduler_process, server, active_workers)
+        shutdown_system(scheduler_process, server)
+    except Exception as e:
+        main_logger.error(f"Error in main loop: {e}")
+        shutdown_system(scheduler_process, server)
 
     # Wait for all worker processes to finish
     for p in processes:
-        p.join()
+        p.join(timeout=1)
+        if p.is_alive():
+            p.terminate()
 
     main_logger.info("Main process exiting")

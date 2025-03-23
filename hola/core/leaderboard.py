@@ -105,9 +105,10 @@ class Leaderboard:
         :return: Number of feasible trials with infinite scores
         :rtype: int
         """
+        poset_indices = self._poset.get_indices() if len(self._poset) > 0 else set()
         return sum(
             1 for tid, trial in self._data.items()
-            if trial.is_feasible and tid not in self._poset.get_indices()
+            if trial.is_feasible and tid not in poset_indices
         )
 
     def get_infeasible_count(self) -> int:
@@ -172,7 +173,13 @@ class Leaderboard:
         """
         if len(self._poset) == 0:
             return None
-        best_index, _ = self._poset.peek(1)[0]
+
+        # Get the best trial from the poset (first front, best crowding distance)
+        best_indices = self._poset.peek(1)
+        if not best_indices:
+            return None
+
+        best_index, _ = best_indices[0]
         return self._data[best_index]
 
     def get_top_k(self, k: int = 1) -> list[Trial]:
@@ -188,7 +195,11 @@ class Leaderboard:
         :return: List of up to k best trials
         :rtype: list[Trial]
         """
-        return [self._data[idx] for idx, _ in self._poset.peek(k)]
+        if len(self._poset) == 0:
+            return []
+
+        top_indices = self._poset.peek(k)
+        return [self._data[idx] for idx, _ in top_indices]
 
     def get_top_k_fronts(self, k: int = 1) -> list[list[Trial]]:
         """
@@ -211,6 +222,10 @@ class Leaderboard:
         """
         if k < 1:
             raise ValueError("k must be positive.")
+
+        # Early return if poset is empty
+        if len(self._poset) == 0:
+            return []
 
         result = []
         # Take the first k fronts from the poset
@@ -243,16 +258,19 @@ class Leaderboard:
         """
         data_rows = []
 
+        # Get indices from poset (safely handle empty poset)
+        poset_indices = self._poset.get_indices() if len(self._poset) > 0 else set()
+
         # Determine which trials to process
         if ranked_only:
-            trial_ids = [key for key, _ in self._poset.items()]
+            trial_ids = [key for key, _ in self._poset.items()] if len(self._poset) > 0 else []
         else:
             trial_ids = list(self._data.keys())
 
         # Process each trial
         for tid in trial_ids:
             trial = self._data[tid]
-            is_ranked = tid in self._poset.get_indices()
+            is_ranked = tid in poset_indices
 
             # Skip unranked trials if ranked_only is True
             if ranked_only and not is_ranked:
@@ -327,6 +345,9 @@ class Leaderboard:
         elif isinstance(trial_ids, int):
             trial_ids = [trial_ids]
 
+        # Get indices from poset (safely handle empty poset)
+        poset_indices = self._poset.get_indices() if len(self._poset) > 0 else set()
+
         # Create rows for the DataFrame
         metadata_rows = []
         for tid in trial_ids:
@@ -341,7 +362,7 @@ class Leaderboard:
             row_data = {
                 "Trial": tid,
                 "Is Feasible": trial.is_feasible,
-                "Is Ranked": tid in self._poset.get_indices(),
+                "Is Ranked": tid in poset_indices,
             }
 
             # Flatten nested metadata
@@ -442,9 +463,27 @@ class Leaderboard:
         # Create new leaderboard
         leaderboard = cls(objective_scorer)
 
-        # Decode trials and add them to the leaderboard
-        trials = msgspec.json.decode(msgspec.json.encode(data["trials"]), type=list[Trial])
-        for trial in trials:
-            leaderboard.add(trial)
+        # Manually deserialize and add trials
+        for trial_data in data.get("trials", []):
+            # Make sure all objective values are floats (no None values)
+            if "objectives" in trial_data:
+                objectives_dict = {}
+                for obj_name, obj_value in trial_data["objectives"].items():
+                    # Convert None to infinity to ensure it's a float
+                    if obj_value is None:
+                        obj_value = float('inf')
+                    objectives_dict[ObjectiveName(obj_name)] = float(obj_value)
+
+                # Create the trial
+                trial = Trial(
+                    trial_id=trial_data["trial_id"],
+                    objectives=objectives_dict,
+                    parameters={ParameterName(k): v for k, v in trial_data.get("parameters", {}).items()},
+                    is_feasible=trial_data.get("is_feasible", True),
+                    metadata=trial_data.get("metadata", {})
+                )
+
+                # Add the trial to the leaderboard
+                leaderboard.add(trial)
 
         return leaderboard
