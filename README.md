@@ -10,6 +10,7 @@ HOLA is a flexible and powerful hyperparameter optimization framework designed f
 - **Flexible parameter types**: continuous, integer, categorical, and lattice-valued
 - **Comparison groups** for handling incomparable objectives
 - **Priority-weighted scoring** for balancing multiple objectives
+- **Modern FastAPI-based HTTP server** for remote workers
 
 ## How It Works
 
@@ -49,18 +50,74 @@ The scoring system works as follows:
 
 ## Usage Example
 
+### Simple Single-Machine Optimization
+
 ```python
-from hola import run_optimization_system
-from hola.core.coordinator import OptimizationCoordinator
-from hola.core.samplers import ExploreExploitSampler, SobolSampler, ClippedGaussianMixtureSampler
+from hola import run_optimization
 
 # Define your parameters
 parameters = {
-    "x": {"tag": "continuous", "min": 0.0, "max": 10.0},
-    "y": {"tag": "continuous", "min": 0.0, "max": 10.0},
+    "x": {"type": "continuous", "min": 0.0, "max": 10.0},
+    "y": {"type": "continuous", "min": 0.0, "max": 10.0},
 }
 
 # Define your objectives
+objectives = {
+    "f1": {
+        "target": 0.0,
+        "limit": 100.0,
+        "direction": "minimize",
+        "priority": 1.0,
+        "comparison_group": 0
+    },
+    "f2": {
+        "target": 0.0,
+        "limit": 100.0,
+        "direction": "minimize",
+        "priority": 0.8,
+        "comparison_group": 0
+    },
+}
+
+# Define your evaluation function
+def evaluate(params):
+    x = params["x"]
+    y = params["y"]
+    f1 = x**2 + y**2
+    f2 = (x-2)**2 + (y-2)**2
+    return {"f1": f1, "f2": f2}
+
+# Run the optimization
+best_trial = run_optimization(
+    objective_function=evaluate,
+    parameters_dict=parameters,
+    objectives_dict=objectives,
+    n_iterations=100,
+    minimum_fit_samples=5
+)
+
+print(f"Best parameters: {best_trial.parameters}")
+print(f"Best objectives: {best_trial.objectives}")
+```
+
+### Distributed Optimization
+
+HOLA supports distributed optimization with a central server and multiple workers, similar to Folding@Home. Workers can connect via ZMQ (IPC or TCP) or HTTP with FastAPI.
+
+```python
+from hola.core.coordinator import OptimizationCoordinator
+from hola.core.samplers import ExploreExploitSampler, SobolSampler, ClippedGaussianMixtureSampler
+from hola.distributed.scheduler import OptimizationScheduler, SchedulerConfig
+from hola.distributed.server import OptimizationServer, ServerConfig
+from hola.distributed.worker import LocalWorker, RemoteWorker, WorkerConfig
+
+# Define parameters and objectives (same as above)
+parameters = {
+    "x": {"type": "continuous", "min": 0.0, "max": 10.0},
+    "y": {"type": "continuous", "min": 0.0, "max": 10.0},
+}
+
+# Define objectives
 objectives = {
     "f1": {
         "target": 0.0,
@@ -82,54 +139,118 @@ objectives = {
 explore_sampler = SobolSampler(dimension=2)
 exploit_sampler = ClippedGaussianMixtureSampler(dimension=2, n_components=2)
 
-# Create an explore-exploit sampler (combines exploration and exploitation)
+# Create an explore-exploit sampler
 sampler = ExploreExploitSampler(
     explore_sampler=explore_sampler,
-    exploit_sampler=exploit_sampler,
-    min_explore_samples=10,
-    min_fit_samples=5
+    exploit_sampler=exploit_sampler
 )
 
 # Create coordinator
 coordinator = OptimizationCoordinator.from_dict(
     hypercube_sampler=sampler,
     objectives_dict=objectives,
-    parameters_dict=parameters
+    parameters_dict=parameters,
+    minimum_fit_samples=5,
+    top_frac=0.2
 )
 
-# Define your evaluation function
-def evaluate(x: float, y: float) -> dict[str, float]:
-    f1 = x**2 + y**2
-    f2 = (x-2)**2 + (y-2)**2
-    return {"f1": f1, "f2": f2}
+# Create scheduler
+scheduler = OptimizationScheduler(coordinator=coordinator)
 
-# TODO: Run the optimization system
-# Run the optimization for a specified number of iterations
-n_iterations = 100
-for i in range(n_iterations):
-    # Get parameter suggestions
-    params_list, metadata = coordinator.suggest_parameters()
+# Create server
+server = OptimizationServer(
+    scheduler=scheduler,
+    config=ServerConfig(
+        zmq_ipc_endpoint="ipc:///tmp/hola-optimization.ipc",  # For local workers
+        zmq_tcp_endpoint="tcp://127.0.0.1:5555",             # For remote workers with ZMQ
+        http_port=8080                                        # For HTTP workers
+    )
+)
 
-    # Evaluate objectives for each parameter set
-    for params in params_list:
-        objectives = evaluate(**params)
+# Start server
+server.start()
 
-        # Record the evaluation results with metadata
-        coordinator.record_evaluation(params, objectives, metadata)
+# Create and start workers
+workers = []
 
-    # Optional: Print progress update
-    if (i + 1) % 10 == 0:
-        print(f"Completed {i + 1}/{n_iterations} iterations")
+# Local worker using ZMQ IPC
+local_worker = LocalWorker(
+    objective_function=evaluate,
+    zmq_ipc_endpoint="ipc:///tmp/hola-optimization.ipc"
+)
+local_worker.start()
+workers.append(local_worker)
 
-    # Get current best trial
-    best_trial = coordinator.get_best_trial()
-    if best_trial:
-        print(f"Current best parameters: {best_trial.parameters}")
-        print(f"Current best objectives: {best_trial.objectives}")
+# Remote worker using ZMQ TCP
+remote_worker_zmq = RemoteWorker(
+    objective_function=evaluate,
+    zmq_tcp_endpoint="tcp://127.0.0.1:5555"
+)
+remote_worker_zmq.start()
+workers.append(remote_worker_zmq)
 
-# Get final result
-result = coordinator.get_best_trial()
+# Remote worker using HTTP
+remote_worker_http = RemoteWorker(
+    objective_function=evaluate,
+    server_url="http://localhost:8080"
+)
+remote_worker_http.start()
+workers.append(remote_worker_http)
 
-print(f"Best parameters: {result.parameters}")
-print(f"Best objectives: {result.objectives}")
+# Monitor progress
+import time
+try:
+    while coordinator.get_total_evaluations() < 100:
+        time.sleep(1.0)
+        print(f"Progress: {coordinator.get_total_evaluations()}/100 evaluations")
+finally:
+    # Stop workers and server
+    for worker in workers:
+        worker.stop()
+    server.stop()
+
+# Get final results
+best_trial = coordinator.get_best_trial()
+print(f"Best parameters: {best_trial.parameters}")
+print(f"Best objectives: {best_trial.objectives}")
 ```
+
+### Using the Simplified Distributed API
+
+For convenience, you can also use the `run_optimization` function with `use_distributed=True`:
+
+```python
+from hola import run_optimization
+
+# Define parameters, objectives, and evaluation function (same as above)
+parameters = {
+    "x": {"type": "continuous", "min": 0.0, "max": 10.0},
+    "y": {"type": "continuous", "min": 0.0, "max": 10.0},
+}
+# ...
+
+# Run distributed optimization
+best_trial = run_optimization(
+    objective_function=evaluate,
+    parameters_dict=parameters,
+    objectives_dict=objectives,
+    n_iterations=100,
+    use_distributed=True,
+    n_workers=4,  # Number of local workers to create
+    minimum_fit_samples=5  # Additional parameter for the coordinator
+)
+
+print(f"Best parameters: {best_trial.parameters}")
+print(f"Best objectives: {best_trial.objectives}")
+```
+
+## External Worker Implementation
+
+For non-Python workers or other languages, you can implement the HTTP API endpoints provided by FastAPI:
+
+1. **Register**: `POST /api/register` with optional `{"worker_id": "..."}` to get a worker ID
+2. **Get Job**: `GET /api/job?worker_id=...` to get parameters to evaluate
+3. **Submit Result**: `POST /api/result` with `{"worker_id": "...", "job_id": "...", "objectives": {...}}`
+4. **Heartbeat**: `POST /api/heartbeat` with `{"worker_id": "..."}` to keep connection alive
+
+The API also includes automatic OpenAPI documentation at `/docs` which provides detailed information about request and response schemas. This allows workers implemented in any language to participate in the optimization.
