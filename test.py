@@ -4,10 +4,8 @@ import random
 import sys
 import threading
 import time
-import asyncio
 from datetime import datetime
-from multiprocessing.sharedctypes import Synchronized
-from typing import Any, Callable, List, Dict, Optional, Tuple, Union
+from typing import Any, Callable, List, Dict, Optional, Union
 
 import msgspec
 import uvicorn
@@ -19,7 +17,6 @@ from hola.core.coordinator import OptimizationCoordinator
 from hola.core.objectives import ObjectiveName
 from hola.core.parameters import ParameterName
 from hola.core.samplers import SobolSampler
-from hola.core.leaderboard import Trial
 
 # ============================================================================
 # Logging Setup
