@@ -42,7 +42,6 @@ streamlit-autorefresh = "^1.0.1"
 dash = "^3.0.0"
 jaxtyping = "^0.3.0"
 websocket-client = "^1.8.0"
-matplotlib = "^3.10.1"
 
 
 [tool.poetry.group.dev.dependencies]

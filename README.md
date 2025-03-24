@@ -86,6 +86,8 @@ exploit_sampler = ClippedGaussianMixtureSampler(dimension=2, n_components=2)
 sampler = ExploreExploitSampler(
     explore_sampler=explore_sampler,
     exploit_sampler=exploit_sampler,
+    min_explore_samples=10,
+    min_fit_samples=5
 )
 
 # Create coordinator

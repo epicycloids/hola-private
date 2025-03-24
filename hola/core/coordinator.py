@@ -16,8 +16,6 @@ promising regions of the parameter space.
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
-import os
-import json
 
 import pandas as pd
 
@@ -25,7 +23,6 @@ from hola.core.leaderboard import Leaderboard, Trial
 from hola.core.objectives import ObjectiveName, ObjectiveScorer
 from hola.core.parameters import ParameterName, ParameterTransformer
 from hola.core.samplers import HypercubeSampler
-from hola.core.repository import TrialRepository, SQLiteTrialRepository
 
 
 @dataclass
@@ -67,8 +64,6 @@ class OptimizationCoordinator:
         parameters_dict: dict[ParameterName, dict[str, Any]],
         top_frac: float = 0.2,
         minimum_fit_samples: int = 20,
-        repository: Optional[TrialRepository] = None,
-        db_path: Optional[str] = None,
     ) -> "OptimizationCoordinator":
         """
         Create coordinator from configuration dictionaries.
@@ -83,20 +78,11 @@ class OptimizationCoordinator:
         :type top_frac: float
         :param minimum_fit_samples: Minimum number of elite samples needed to fit exploit sampler
         :type minimum_fit_samples: int
-        :param repository: Optional repository for trial storage
-        :type repository: Optional[TrialRepository]
-        :param db_path: Path to SQLite database file (creates a SQLiteTrialRepository if provided)
-        :type db_path: Optional[str]
         :return: Configured optimization coordinator
         :rtype: OptimizationCoordinator
         """
         objective_scorer = ObjectiveScorer.from_dict(objectives_dict)
-
-        # If db_path is provided, create a SQLite repository
-        if db_path is not None and repository is None:
-            repository = SQLiteTrialRepository(db_path)
-
-        leaderboard = Leaderboard(objective_scorer, repository)
+        leaderboard = Leaderboard(objective_scorer)
         parameter_transformer = ParameterTransformer.from_dict(parameters_dict)
         return cls(
             hypercube_sampler=hypercube_sampler,
@@ -333,6 +319,9 @@ class OptimizationCoordinator:
         :param filepath: Path where the JSON file will be saved
         :type filepath: str
         """
+        import os
+        import json
+
         # Create directory if it doesn't exist
         os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
 
@@ -373,7 +362,7 @@ class OptimizationCoordinator:
             json.dump(config, f, indent=2)
 
     @classmethod
-    def load_from_file(cls, filepath: str, repository: Optional[TrialRepository] = None) -> "OptimizationCoordinator":
+    def load_from_file(cls, filepath: str) -> "OptimizationCoordinator":
         """
         Load an optimization coordinator from a JSON file.
 
@@ -382,12 +371,12 @@ class OptimizationCoordinator:
 
         :param filepath: Path to the JSON file to load
         :type filepath: str
-        :param repository: Optional repository to use for trial storage
-        :type repository: Optional[TrialRepository]
         :return: A new OptimizationCoordinator with the restored state
         :rtype: OptimizationCoordinator
         :raises FileNotFoundError: If the file doesn't exist
         """
+        import os
+        import json
         from hola.core.samplers import create_sampler_from_state
 
         # Check if file exists
@@ -417,7 +406,7 @@ class OptimizationCoordinator:
 
         # Load leaderboard
         leaderboard_file = os.path.join(temp_dir, "leaderboard.json")
-        leaderboard = Leaderboard.load_from_file(leaderboard_file, objective_scorer, repository)
+        leaderboard = Leaderboard.load_from_file(leaderboard_file, objective_scorer)
 
         # Create coordinator
         coordinator = cls(
