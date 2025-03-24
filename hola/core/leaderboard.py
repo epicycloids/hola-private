@@ -30,32 +30,7 @@ import msgspec
 from hola.core.objectives import ObjectiveName, ObjectiveScorer
 from hola.core.parameters import ParameterName
 from hola.core.poset import ScalarPoset, VectorPoset
-
-
-class Trial(Struct, frozen=True):
-    """
-    Immutable record of a single optimization trial.
-
-    Contains all information about a trial including its unique identifier,
-    the parameter values used, the objective values achieved, whether
-    the parameter values are considered feasible under current constraints,
-    and any associated metadata.
-    """
-
-    trial_id: int
-    """Unique identifier for the trial."""
-
-    objectives: dict[ObjectiveName, float]
-    """Dictionary mapping objective names to their achieved values."""
-
-    parameters: dict[ParameterName, Any]
-    """Dictionary mapping parameter names to their trial values."""
-
-    is_feasible: bool = True
-    """Whether the parameter values satisfy current constraints."""
-
-    metadata: Dict[str, Any] = {}
-    """Additional metadata about the trial, such as sampler information."""
+from hola.core.repository import Trial, TrialRepository, MemoryTrialRepository
 
 
 class Leaderboard:
@@ -69,18 +44,20 @@ class Leaderboard:
     ordered by crowding distance to promote diversity in parameter choices.
     """
 
-    def __init__(self, objective_scorer: ObjectiveScorer):
+    def __init__(self, objective_scorer: ObjectiveScorer, repository: Optional[TrialRepository] = None):
         """
         Initialize the leaderboard.
 
         :param objective_scorer: Scorer that defines how to evaluate trials
         :type objective_scorer: ObjectiveScorer
+        :param repository: Repository for trial storage, or None to use in-memory storage
+        :type repository: Optional[TrialRepository]
         """
         self._objective_scorer = objective_scorer
         self._poset = (
             VectorPoset[int]() if self._objective_scorer.is_multigroup else ScalarPoset[int]()
         )
-        self._data: dict[int, Trial] = {}
+        self._repository = repository if repository is not None else MemoryTrialRepository()
 
     def get_feasible_count(self) -> int:
         """
@@ -93,7 +70,7 @@ class Leaderboard:
         :return: Number of feasible trials in the leaderboard
         :rtype: int
         """
-        return sum(1 for trial in self._data.values() if trial.is_feasible)
+        return len(self._repository.get_feasible_trials())
 
     def get_feasible_infinite_count(self) -> int:
         """
@@ -107,8 +84,8 @@ class Leaderboard:
         """
         poset_indices = self._poset.get_indices() if len(self._poset) > 0 else set()
         return sum(
-            1 for tid, trial in self._data.items()
-            if trial.is_feasible and tid not in poset_indices
+            1 for trial in self._repository.get_feasible_trials()
+            if trial.trial_id not in poset_indices
         )
 
     def get_infeasible_count(self) -> int:
@@ -120,7 +97,7 @@ class Leaderboard:
         :return: Number of infeasible trials
         :rtype: int
         """
-        return sum(1 for trial in self._data.values() if not trial.is_feasible)
+        return sum(1 for trial in self._repository.get_all_trials() if not trial.is_feasible)
 
     def get_total_count(self) -> int:
         """
@@ -134,7 +111,7 @@ class Leaderboard:
         :return: Total number of trials stored in the leaderboard
         :rtype: int
         """
-        return len(self._data)
+        return len(self._repository.get_trial_ids())
 
     def get_ranked_count(self) -> int:
         """
@@ -158,7 +135,10 @@ class Leaderboard:
         :rtype: Trial
         :raises KeyError: If trial_id doesn't exist
         """
-        return self._data[trial_id]
+        trial = self._repository.get_trial(trial_id)
+        if trial is None:
+            raise KeyError(f"Trial with ID {trial_id} not found")
+        return trial
 
     def get_best_trial(self) -> Trial | None:
         """
@@ -180,7 +160,7 @@ class Leaderboard:
             return None
 
         best_index, _ = best_indices[0]
-        return self._data[best_index]
+        return self._repository.get_trial(best_index)
 
     def get_top_k(self, k: int = 1) -> list[Trial]:
         """
@@ -199,7 +179,12 @@ class Leaderboard:
             return []
 
         top_indices = self._poset.peek(k)
-        return [self._data[idx] for idx, _ in top_indices]
+        result = []
+        for idx, _ in top_indices:
+            trial = self._repository.get_trial(idx)
+            if trial is not None:
+                result.append(trial)
+        return result
 
     def get_top_k_fronts(self, k: int = 1) -> list[list[Trial]]:
         """
@@ -234,7 +219,11 @@ class Leaderboard:
                 break
 
             # Convert each front from (id, score) tuples to Trial objects
-            trial_front = [self._data[trial_id] for trial_id, _ in front]
+            trial_front = []
+            for trial_id, _ in front:
+                trial = self._repository.get_trial(trial_id)
+                if trial is not None:
+                    trial_front.append(trial)
             result.append(trial_front)
 
         return result
@@ -256,63 +245,31 @@ class Leaderboard:
         :return: DataFrame containing trial information
         :rtype: pd.DataFrame
         """
-        data_rows = []
+        # First get basic dataframe from repository
+        df = self._repository.get_dataframe(ranked_only)
 
-        # Get indices from poset (safely handle empty poset)
-        poset_indices = self._poset.get_indices() if len(self._poset) > 0 else set()
+        if df.empty:
+            return df
 
-        # Determine which trials to process
+        # Add poset-specific information for ranked trials
         if ranked_only:
-            trial_ids = [key for key, _ in self._poset.items()] if len(self._poset) > 0 else []
-        else:
-            trial_ids = list(self._data.keys())
+            # Add score and crowding distance columns
+            df["Crowding Distance"] = df["Trial"].apply(
+                lambda tid: self._poset.get_crowding_distance(tid)
+                if tid in self._poset.get_indices() else None
+            )
 
-        # Process each trial
-        for tid in trial_ids:
-            trial = self._data[tid]
-            is_ranked = tid in poset_indices
+            # Add score columns
+            for tid in df["Trial"]:
+                if tid in self._poset:
+                    score = self._poset[tid]
+                    if self._objective_scorer.is_multigroup:
+                        for j in range(len(score)):
+                            df.loc[df["Trial"] == tid, f"Group {j} Score"] = score[j]
+                    else:
+                        df.loc[df["Trial"] == tid, "Group Score"] = score
 
-            # Skip unranked trials if ranked_only is True
-            if ranked_only and not is_ranked:
-                continue
-
-            # Basic information for all trials
-            row_data = {
-                "Trial": tid,
-                **{str(k): v for k, v in trial.parameters.items()},
-                **{str(k): v for k, v in trial.objectives.items()},
-            }
-
-            # Add status columns for all trials mode
-            if not ranked_only:
-                row_data["Is Ranked"] = is_ranked
-                row_data["Is Feasible"] = trial.is_feasible
-
-            # Add score information for ranked trials
-            if is_ranked:
-                score = self._poset[tid]
-                crowding_distance = self._poset.get_crowding_distance(tid)
-                row_data["Crowding Distance"] = crowding_distance
-
-                if self._objective_scorer.is_multigroup:
-                    for j in range(len(score)):
-                        row_data[f"Group {j} Score"] = score[j]
-                else:
-                    row_data["Group Score"] = score
-
-            data_rows.append(row_data)
-
-        # Create and return DataFrame
-        if not data_rows:
-            # Return empty DataFrame with appropriate columns
-            columns = ["Trial"]
-            if not ranked_only:
-                columns.extend(["Is Ranked", "Is Feasible"])
-            if ranked_only or any(row.get("Crowding Distance") is not None for row in data_rows):
-                columns.append("Crowding Distance")
-            return pd.DataFrame(columns=columns)
-
-        return pd.DataFrame(data_rows)
+        return df
 
     def get_all_trials_dataframe(self) -> pd.DataFrame:
         """
@@ -341,7 +298,8 @@ class Leaderboard:
         """
         # If no trial_ids provided, use all trials that have metadata
         if trial_ids is None:
-            trial_ids = [tid for tid, trial in self._data.items() if trial.metadata]
+            all_trials = self._repository.get_all_trials()
+            trial_ids = [trial.trial_id for trial in all_trials if trial.metadata]
         elif isinstance(trial_ids, int):
             trial_ids = [trial_ids]
 
@@ -351,11 +309,8 @@ class Leaderboard:
         # Create rows for the DataFrame
         metadata_rows = []
         for tid in trial_ids:
-            if tid not in self._data:
-                continue
-
-            trial = self._data[tid]
-            if not trial.metadata:
+            trial = self._repository.get_trial(tid)
+            if trial is None or not trial.metadata:
                 continue
 
             # Start with trial ID and feasibility for the row
@@ -386,7 +341,7 @@ class Leaderboard:
         """
         Add a new trial to the leaderboard.
 
-        All trials are stored in the data dictionary, but only feasible trials
+        All trials are stored in the repository, but only feasible trials
         with all finite scores are added to the partial ordering for ranking.
 
         Trials with infinite scores or that violate feasibility constraints
@@ -395,12 +350,15 @@ class Leaderboard:
         :param trial: Trial to add
         :type trial: Trial
         """
-        index = trial.trial_id
-        self._data[index] = trial
+        is_ranked = False
         if trial.is_feasible:
             group_values = self._objective_scorer.score(trial.objectives)
-            if np.all(group_values < float("inf")):
-                self._poset.add(index, group_values)
+            if np.all(np.array(group_values) < float("inf")):
+                self._poset.add(trial.trial_id, group_values)
+                is_ranked = True
+
+        # Add to repository with ranked status
+        self._repository.add_trial(trial, is_ranked=is_ranked)
 
     def save_to_file(self, filepath: str) -> None:
         """
@@ -417,7 +375,7 @@ class Leaderboard:
 
         # Create output structure with trials list
         output = {
-            "trials": list(self._data.values()),
+            "trials": self._repository.get_all_trials(),
             "is_multigroup": self._objective_scorer.is_multigroup
         }
 
@@ -427,7 +385,8 @@ class Leaderboard:
             f.write(encoded)
 
     @classmethod
-    def load_from_file(cls, filepath: str, objective_scorer: ObjectiveScorer) -> "Leaderboard":
+    def load_from_file(cls, filepath: str, objective_scorer: ObjectiveScorer,
+                      repository: Optional[TrialRepository] = None) -> "Leaderboard":
         """
         Load a leaderboard from a JSON file.
 
@@ -438,6 +397,8 @@ class Leaderboard:
         :type filepath: str
         :param objective_scorer: The objective scorer to use for the loaded leaderboard
         :type objective_scorer: ObjectiveScorer
+        :param repository: Optional repository to use for trial storage
+        :type repository: Optional[TrialRepository]
         :return: A new Leaderboard instance with the loaded trials
         :rtype: Leaderboard
         :raises FileNotFoundError: If the file doesn't exist
@@ -460,8 +421,8 @@ class Leaderboard:
                 f"objective_scorer has is_multigroup={objective_scorer.is_multigroup}"
             )
 
-        # Create new leaderboard
-        leaderboard = cls(objective_scorer)
+        # Create new leaderboard with specified or in-memory repository
+        leaderboard = cls(objective_scorer, repository)
 
         # Manually deserialize and add trials
         for trial_data in data.get("trials", []):

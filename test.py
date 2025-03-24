@@ -4,10 +4,9 @@ import random
 import sys
 import threading
 import time
-import asyncio
 from datetime import datetime
-from multiprocessing.sharedctypes import Synchronized
-from typing import Any, Callable, List, Dict, Optional, Tuple, Union
+from typing import Any, Callable, List, Dict, Optional, Union
+import os
 
 import msgspec
 import uvicorn
@@ -19,7 +18,6 @@ from hola.core.coordinator import OptimizationCoordinator
 from hola.core.objectives import ObjectiveName
 from hola.core.parameters import ParameterName
 from hola.core.samplers import SobolSampler
-from hola.core.leaderboard import Trial
 
 # ============================================================================
 # Logging Setup
@@ -41,10 +39,13 @@ def setup_logging(name: str, level: int = logging.INFO) -> logging.Logger:
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    # Create file handler
-    file_handler = logging.FileHandler(
-        f'scheduler_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
-    )
+    # Create logs directory if it doesn't exist
+    logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+    os.makedirs(logs_dir, exist_ok=True)
+
+    # Create file handler in the logs directory
+    log_file_path = os.path.join(logs_dir, f'scheduler_{name}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+    file_handler = logging.FileHandler(log_file_path)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
@@ -107,6 +108,10 @@ class IsMultiGroupRequest(Struct, tag="is_multi_group", tag_field="tag"):
     pass
 
 
+class SaveLeaderboardRequest(Struct, tag="save_leaderboard", tag_field="tag"):
+    filepath: str
+
+
 # Response Messages
 class GetSuggestionResponse(Struct, tag="suggestion_response", tag_field="tag"):
     parameters: dict[ParameterName, Any] | None
@@ -144,6 +149,11 @@ class IsMultiGroupResponse(Struct, tag="multi_group_response", tag_field="tag"):
     is_multi_group: bool
 
 
+class SaveLeaderboardResponse(Struct, tag="save_leaderboard_response", tag_field="tag"):
+    success: bool
+    error: str | None = None
+
+
 # Define the message union type
 Message = (
     GetSuggestionRequest
@@ -155,6 +165,7 @@ Message = (
     | GetMetadataRequest
     | GetTopKRequest
     | IsMultiGroupRequest
+    | SaveLeaderboardRequest
     | GetSuggestionResponse
     | SubmitResultResponse
     | HeartbeatResponse
@@ -163,6 +174,7 @@ Message = (
     | GetMetadataResponse
     | GetTopKResponse
     | IsMultiGroupResponse
+    | SaveLeaderboardResponse
 )
 
 
@@ -229,6 +241,23 @@ class SchedulerProcess:
 
         # For tracking the current best objective values
         self.best_objectives = None
+
+    def save_leaderboard(self, filepath: str) -> bool:
+        """Save the leaderboard state to a file.
+
+        :param filepath: Path where the JSON file will be saved
+        """
+        try:
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+
+            # Save the coordinator state to file
+            self.coordinator.save_to_file(filepath)
+            self.logger.info(f"Successfully saved leaderboard to {filepath}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to save leaderboard: {e}")
+            return False
 
     def run(self):
         # Create context and main socket
@@ -344,6 +373,8 @@ class SchedulerProcess:
                                 message = GetTopKRequest(k=message_dict.get("k", 1))
                             elif tag == "is_multi_group":
                                 message = IsMultiGroupRequest()
+                            elif tag == "save_leaderboard":
+                                message = SaveLeaderboardRequest(filepath=message_dict.get("filepath"))
                             else:
                                 # Unknown message type, reply with error
                                 main_socket.send(
@@ -533,6 +564,19 @@ class SchedulerProcess:
                                     )
                                 )
 
+                        case SaveLeaderboardRequest():
+                            try:
+                                success = self.save_leaderboard(message.filepath)
+                                response = SaveLeaderboardResponse(success=success)
+                                main_socket.send(msgspec.json.encode(response))
+                            except Exception as e:
+                                self.logger.error(f"Error saving leaderboard: {e}")
+                                main_socket.send(
+                                    msgspec.json.encode(
+                                        SaveLeaderboardResponse(success=False, error=str(e))
+                                    )
+                                )
+
                         case _:
                             self.logger.error(f"Unknown message type: {type(message)}")
                             main_socket.send(
@@ -600,25 +644,20 @@ class SchedulerProcess:
         # Add to history
         self.result_history.append(result)
 
-        # Get the current best trial before adding the new one
-        previous_best = self.coordinator.get_best_trial()
-        previous_best_objectives = previous_best.objectives if previous_best else None
-
         # Record the new evaluation in the coordinator
+        new_trial_id = self.coordinator.get_total_evaluations()  # This will be the ID of the new trial
         self.coordinator.record_evaluation(
             result.parameters, result.objectives, metadata={"source": "worker"}
         )
 
-        # Get the current best trial after adding the new one
+        # Get current best trial after adding the new one
         current_best = self.coordinator.get_best_trial()
 
-        # Determine if this is the new best trial
+        # Determine if this is the new best trial (i.e., if the new trial improved on the previous best)
         is_best = False
-        if previous_best is None:
-            # If there was no previous best, this is the best by default
-            is_best = True
-        elif current_best and current_best.trial_id != previous_best.trial_id:
-            # The best trial ID changed, so this must be the new best
+
+        # If no previous best existed, this is the first feasible trial
+        if current_best.trial_id == new_trial_id:
             is_best = True
 
         # Only log at INFO level if it's the best result, otherwise debug
@@ -628,7 +667,7 @@ class SchedulerProcess:
                 f"total_evaluations={self.coordinator.get_total_evaluations()}"
             )
             # Update our tracked best objectives
-            self.best_objectives = current_best.objectives if current_best else result.objectives
+            self.best_objectives = current_best.objectives if current_best else None
         else:
             self.logger.debug(
                 f"Trial completed: objectives={result.objectives}, "
@@ -1030,6 +1069,19 @@ class RESTIsMultiGroupResponse(msgspec.Struct):
     error: str | None = None
 
 
+class RESTSaveLeaderboardRequest(msgspec.Struct):
+    """Request body for POST /save_leaderboard."""
+
+    filepath: str
+
+
+class RESTSaveLeaderboardResponse(msgspec.Struct):
+    """Response to POST /save_leaderboard."""
+
+    success: bool
+    error: str | None = None
+
+
 # ============================================================================
 # REST API Server
 # ============================================================================
@@ -1308,6 +1360,36 @@ class Server:
                     RESTIsMultiGroupResponse(is_multi_group=False, error=f"Error: {str(e)}")
                 )
 
+        @self.rest_app.post("/save_leaderboard", response_model=None)
+        async def save_leaderboard(request: Request) -> bytes:
+            try:
+                body = await request.body()
+                save_req = msgspec.json.decode(body, type=RESTSaveLeaderboardRequest)
+
+                # Send save request to scheduler
+                request = SaveLeaderboardRequest(filepath=save_req.filepath)
+                self.socket.send(msgspec.json.encode(request))
+
+                response = msgspec.json.decode(self.socket.recv(), type=Message)
+
+                match response:
+                    case SaveLeaderboardResponse(success=success, error=error):
+                        return msgspec.json.encode(
+                            RESTSaveLeaderboardResponse(success=success, error=error)
+                        )
+                    case _:
+                        return msgspec.json.encode(
+                            RESTSaveLeaderboardResponse(
+                                success=False,
+                                error="Unexpected response from scheduler"
+                            )
+                        )
+            except Exception as e:
+                self.logger.error(f"Error saving leaderboard: {e}")
+                return msgspec.json.encode(
+                    RESTSaveLeaderboardResponse(success=False, error=f"Error: {str(e)}")
+                )
+
         @self.rest_app.get("/history")
         async def get_history():
             """Endpoint to get optimization history"""
@@ -1560,6 +1642,35 @@ if __name__ == "__main__":
             main_logger.error("Timeout when requesting final status")
 
         status_socket.close()
+
+        # Test the save leaderboard functionality
+        main_logger.info("Testing leaderboard saving functionality")
+        save_context = zmq.Context()
+        save_socket = save_context.socket(zmq.REQ)
+        save_socket.connect("ipc:///tmp/scheduler.ipc")
+
+        # Create outputs directory if it doesn't exist
+        outputs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'outputs')
+        os.makedirs(outputs_dir, exist_ok=True)
+
+        # Save the leaderboard to a file
+        save_filepath = os.path.join(outputs_dir, f'leaderboard_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
+        save_socket.send(msgspec.json.encode(SaveLeaderboardRequest(filepath=save_filepath)))
+
+        if save_socket.poll(5000):  # 5 second timeout
+            save_response = msgspec.json.decode(save_socket.recv(), type=Message)
+            if isinstance(save_response, SaveLeaderboardResponse):
+                if save_response.success:
+                    main_logger.info(f"Successfully saved leaderboard to {save_filepath}")
+                else:
+                    main_logger.error(f"Failed to save leaderboard: {save_response.error}")
+            else:
+                main_logger.error(f"Unexpected response type when saving leaderboard")
+        else:
+            main_logger.error("Timeout when saving leaderboard")
+
+        save_socket.close()
+        save_context.term()
 
         main_logger.info("Initiating final shutdown sequence")
         shutdown_system(scheduler_process, server)
