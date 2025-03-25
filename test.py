@@ -1,5 +1,6 @@
 import logging
 import multiprocessing as mp
+import os
 import random
 import sys
 import threading
@@ -12,11 +13,12 @@ import uvicorn
 import zmq
 from fastapi import FastAPI, Request
 from msgspec import Struct
+import numpy as np
 
 from hola.core.coordinator import OptimizationCoordinator
 from hola.core.objectives import ObjectiveName
 from hola.core.parameters import ParameterName
-from hola.core.samplers import SobolSampler
+from hola.core.samplers import SobolSampler, ClippedGaussianMixtureSampler, ExploreExploitSampler
 
 # ============================================================================
 # Logging Setup
@@ -38,10 +40,13 @@ def setup_logging(name: str, level: int = logging.INFO) -> logging.Logger:
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    # Create file handler
-    file_handler = logging.FileHandler(
-        f'scheduler_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
-    )
+    # Create logs directory if it doesn't exist
+    logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+    os.makedirs(logs_dir, exist_ok=True)
+
+    # Create file handler in the logs directory
+    log_file_path = os.path.join(logs_dir, f'scheduler_{name}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+    file_handler = logging.FileHandler(log_file_path)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
@@ -203,6 +208,8 @@ class SchedulerProcess:
         coordinator: OptimizationCoordinator,
         max_retries: int = 3,
         worker_timeout_seconds: float = 300.0,
+        save_interval: int = 10,  # Save coordinator state every 10 trials by default
+        save_dir: str = "optimization_results",  # Directory for saving results
     ):
         self.coordinator = coordinator
         self.running: bool = False
@@ -226,6 +233,110 @@ class SchedulerProcess:
 
         # For tracking the current best objective values
         self.best_objectives = None
+
+        # Save configuration
+        self.save_interval = save_interval
+
+        # Base directory for saving results
+        self.base_save_dir = save_dir
+        # Create base save directory if it doesn't exist
+        os.makedirs(self.base_save_dir, exist_ok=True)
+
+        # Create a timestamped subdirectory for this optimization run
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.save_dir = os.path.join(self.base_save_dir, f"run_{timestamp}")
+        os.makedirs(self.save_dir, exist_ok=True)
+        self.logger.info(f"Created optimization run directory: {self.save_dir}")
+
+        # Save README with initial information
+        self.save_readme()
+
+        # Track the last trial count when coordinator was saved
+        self.last_save_count = 0
+
+    def save_readme(self) -> None:
+        """
+        Save a README file with basic information about the optimization run.
+        """
+        try:
+            readme_path = os.path.join(self.save_dir, "README.txt")
+
+            # Get information about objectives and parameters
+            # Using safer approach to get info in case methods don't exist
+            try:
+                if hasattr(self.coordinator.leaderboard._objective_scorer, 'get_info'):
+                    objective_info = self.coordinator.leaderboard._objective_scorer.get_info()
+                else:
+                    # Fallback to a simple representation
+                    try:
+                        objective_names = self.coordinator.leaderboard._objective_scorer.objective_names
+                    except AttributeError:
+                        # If objective_names attribute doesn't exist, try to infer from another source
+                        try:
+                            objective_names = list(self.coordinator.leaderboard._objective_scorer.objective_directions.keys())
+                        except (AttributeError, KeyError):
+                            objective_names = ["unknown_objective"]
+
+                    objective_info = {name: {"direction": "unknown"}
+                                     for name in objective_names}
+            except Exception as e:
+                self.logger.warning(f"Could not get objective info: {e}")
+                objective_info = {}
+
+            try:
+                if hasattr(self.coordinator.parameter_transformer, 'get_info'):
+                    param_info = self.coordinator.parameter_transformer.get_info()
+                else:
+                    # Fallback to a simple representation
+                    try:
+                        parameter_names = self.coordinator.parameter_transformer.parameter_names
+                    except AttributeError:
+                        # If parameter_names attribute doesn't exist, try to infer from another source
+                        try:
+                            parameter_names = list(self.coordinator.parameter_transformer.parameters.keys())
+                        except (AttributeError, KeyError):
+                            parameter_names = ["unknown_parameter"]
+
+                    param_info = {name: {"type": "unknown"}
+                                 for name in parameter_names}
+            except Exception as e:
+                self.logger.warning(f"Could not get parameter info: {e}")
+                param_info = {}
+
+            with open(readme_path, 'w') as f:
+                f.write("Optimization Run Information\n")
+                f.write("===========================\n\n")
+                f.write(f"Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+
+                f.write("Objectives:\n")
+                if objective_info:
+                    for obj_name, obj_config in objective_info.items():
+                        direction = obj_config.get('direction', 'unknown')
+                        f.write(f"  - {obj_name}: {direction}\n")
+                else:
+                    f.write("  (Objective information not available)\n")
+
+                f.write("\nParameters:\n")
+                if param_info:
+                    for param_name, param_config in param_info.items():
+                        param_type = param_config.get('type', 'unknown')
+                        if param_type == 'continuous':
+                            min_val = param_config.get('min', 'unknown')
+                            max_val = param_config.get('max', 'unknown')
+                            f.write(f"  - {param_name}: {param_type} [{min_val}, {max_val}]\n")
+                        else:
+                            f.write(f"  - {param_name}: {param_type}\n")
+                else:
+                    f.write("  (Parameter information not available)\n")
+
+                f.write("\nFiles:\n")
+                f.write("  - coordinator_state.json: Complete optimizer state\n")
+                f.write("  - README.txt: This file\n")
+
+            self.logger.info(f"Saved README file to {readme_path}")
+        except Exception as e:
+            self.logger.error(f"Error saving README file: {e}")
+            # Continue even if README creation fails
 
     def run(self):
         # Create context and main socket
@@ -406,6 +517,13 @@ class SchedulerProcess:
                                 )
 
                                 is_best = self.register_completed(message.result)
+
+                                # Save coordinator state if we've reached the save interval
+                                total_evaluations = self.coordinator.get_total_evaluations()
+                                if total_evaluations - self.last_save_count >= self.save_interval:
+                                    self.save_coordinator_state()
+                                    self.last_save_count = total_evaluations
+
                                 # Add is_best flag to the response
                                 response = SubmitResultResponse(
                                     success=True, is_best=is_best
@@ -422,6 +540,9 @@ class SchedulerProcess:
                             main_socket.send(msgspec.json.encode(response))
 
                         case ShutdownRequest():
+                            # Save coordinator state before shutting down
+                            self.save_coordinator_state()
+
                             self.running = False
                             main_socket.send(
                                 msgspec.json.encode(SubmitResultResponse(success=True))
@@ -547,6 +668,9 @@ class SchedulerProcess:
                 except:
                     pass
 
+        # Save final state before closing
+        self.save_coordinator_state()
+
         self.logger.info("Scheduler cleaning up...")
         main_socket.close()
         heartbeat_socket.close()
@@ -597,12 +721,8 @@ class SchedulerProcess:
         # Add to history
         self.result_history.append(result)
 
-        # Get the current best trial before adding the new one
-        previous_best = self.coordinator.get_best_trial()
-        previous_best_objectives = previous_best.objectives if previous_best else None
-
         # Record the new evaluation in the coordinator
-        self.coordinator.record_evaluation(
+        current_trial = self.coordinator.record_evaluation(
             result.parameters, result.objectives, metadata={"source": "worker"}
         )
 
@@ -611,10 +731,7 @@ class SchedulerProcess:
 
         # Determine if this is the new best trial
         is_best = False
-        if previous_best is None:
-            # If there was no previous best, this is the best by default
-            is_best = True
-        elif current_best and current_best.trial_id != previous_best.trial_id:
+        if current_best is not None and current_trial is not None and current_best.trial_id == current_trial.trial_id:
             # The best trial ID changed, so this must be the new best
             is_best = True
 
@@ -633,6 +750,34 @@ class SchedulerProcess:
             )
 
         return is_best
+
+    def save_coordinator_state(self) -> None:
+        """
+        Save the entire coordinator state to a fixed file using a temporary file approach.
+        """
+        try:
+            trial_count = self.coordinator.get_total_evaluations()
+
+            # Use simple filenames without timestamps since we have a timestamped directory
+            filename = "coordinator_state.json"
+            filepath = os.path.join(self.save_dir, filename)
+            temp_filepath = f"{filepath}.temp"
+
+            # Save coordinator state to a temporary file
+            self.coordinator.save_to_file(temp_filepath)
+
+            # Atomically rename the temporary file to the final filename
+            os.replace(temp_filepath, filepath)
+
+            self.logger.info(f"Updated coordinator state at {filepath} (trials: {trial_count})")
+        except Exception as e:
+            self.logger.error(f"Error saving coordinator state: {e}")
+            # Clean up the temporary file if it exists
+            if 'temp_filepath' in locals() and os.path.exists(temp_filepath):
+                try:
+                    os.remove(temp_filepath)
+                except:
+                    pass
 
 
 # ============================================================================
@@ -694,7 +839,22 @@ class LocalWorker:
                         poller.register(socket, zmq.POLLIN)
 
                         if poller.poll(10000):  # 10 second timeout
-                            response = msgspec.json.decode(socket.recv(), type=Message)
+                            response_bytes = socket.recv()
+                            try:
+                                response = msgspec.json.decode(response_bytes, type=Message)
+                            except msgspec.ValidationError as ve:
+                                # Try to decode as a more generic type
+                                self.logger.warning(f"Worker {self.worker_id}: Validation error: {ve}, trying generic decode")
+                                try:
+                                    response_dict = msgspec.json.decode(response_bytes)
+                                    if "parameters" in response_dict:
+                                        response = GetSuggestionResponse(parameters=response_dict.get("parameters"))
+                                    else:
+                                        self.logger.error(f"Worker {self.worker_id}: Cannot parse response: {response_dict}")
+                                        raise ValueError(f"Cannot parse response: {response_dict}")
+                                except Exception as e:
+                                    self.logger.error(f"Worker {self.worker_id}: Failed to decode response: {e}")
+                                    raise
                         else:
                             self.logger.warning(
                                 f"Worker {self.worker_id}: Response timeout, retrying..."
@@ -750,9 +910,28 @@ class LocalWorker:
 
                                     # Set a timeout for receiving the response
                                     if poller.poll(10000):  # 10 second timeout
-                                        response = msgspec.json.decode(
-                                            socket.recv(), type=Message
-                                        )
+                                        response_bytes = socket.recv()
+                                        try:
+                                            response = msgspec.json.decode(
+                                                response_bytes, type=Message
+                                            )
+                                        except msgspec.ValidationError as ve:
+                                            # Try to decode as a more generic type
+                                            self.logger.warning(f"Worker {self.worker_id}: Result submission validation error: {ve}, trying generic decode")
+                                            try:
+                                                response_dict = msgspec.json.decode(response_bytes)
+                                                if "success" in response_dict:
+                                                    response = SubmitResultResponse(
+                                                        success=response_dict.get("success", False),
+                                                        is_best=response_dict.get("is_best", False),
+                                                        error=response_dict.get("error")
+                                                    )
+                                                else:
+                                                    self.logger.error(f"Worker {self.worker_id}: Cannot parse result response: {response_dict}")
+                                                    raise ValueError(f"Cannot parse result response: {response_dict}")
+                                            except Exception as e:
+                                                self.logger.error(f"Worker {self.worker_id}: Failed to decode result response: {e}")
+                                                raise
                                     else:
                                         self.logger.warning(
                                             f"Worker {self.worker_id}: Result submission timeout"
@@ -1408,6 +1587,7 @@ def shutdown_system(scheduler_process: mp.Process, server: Server):
     try:
         # Use the proper ShutdownRequest message type
         shutdown_request = ShutdownRequest()
+        logger.info("Sending shutdown request to scheduler (will trigger coordinator save)...")
         socket.send(msgspec.json.encode(shutdown_request))
 
         # Wait for response with timeout
@@ -1449,14 +1629,47 @@ if __name__ == "__main__":
     main_logger = setup_logging("Main")
 
     # Create and configure OptimizationCoordinator
-    hypercube_sampler = SobolSampler(dimension=2)
-    objectives_dict = {
-        "objective1": {"direction": "minimize", "target": 1e-6, "limit": 0.9}
-    }
+    # Simple parameter space with just two variables
     parameters_dict = {
-        "param1": {"type": "continuous", "min": 0.0, "max": 1.0},
-        "param2": {"type": "continuous", "min": 0.0, "max": 1.0},
+        "x": {"type": "continuous", "min": -5.0, "max": 5.0, "scale": "linear"},
+        "y": {"type": "continuous", "min": -5.0, "max": 5.0, "scale": "linear"},
     }
+
+    # Define three objectives in two comparison groups
+    objectives_dict = {
+        "objective1": {
+            "direction": "maximize",
+            "target": 1.0,
+            "limit": 0.0,
+            "priority": 1.0,
+            "comparison_group": 0
+        },
+        "objective2": {
+            "direction": "minimize",
+            "target": 0.0,
+            "limit": 10.0,
+            "priority": 0.8,
+            "comparison_group": 0
+        },
+        "objective3": {
+            "direction": "minimize",
+            "target": 0.0,
+            "limit": 10.0,
+            "priority": 0.7,
+            "comparison_group": 1
+        }
+    }
+
+    # Create samplers for exploration and exploitation
+    dimension = len(parameters_dict)
+    explore_sampler = SobolSampler(dimension=dimension)
+    exploit_sampler = ClippedGaussianMixtureSampler(dimension=dimension, n_components=2)
+
+    # Create the explore-exploit sampler
+    hypercube_sampler = ExploreExploitSampler(
+        explore_sampler=explore_sampler,
+        exploit_sampler=exploit_sampler
+    )
 
     coordinator = OptimizationCoordinator.from_dict(
         hypercube_sampler=hypercube_sampler,
@@ -1464,21 +1677,36 @@ if __name__ == "__main__":
         parameters_dict=parameters_dict,
     )
 
-    # Example evaluation function
-    def example_evaluation_fn(param1: float, param2: float) -> dict[str, float]:
-        # Add some random sleep to simulate work and occasional timeouts
-        duration = random.uniform(0.1, 1.5)
-        # Simulate worker crash occasionally
-        if random.random() < 0.05:  # 5% chance of "crash"
-            main_logger.info(f"Simulating worker crash (sleeping for 10 seconds)")
-            time.sleep(10)
+    # Simple evaluation function with 3 objectives
+    def example_evaluation_fn(x: float, y: float) -> dict[str, float]:
+        # Add a small random delay to simulate computation time
+        time.sleep(random.uniform(0.5, 1.5))
 
-        time.sleep(duration)
-        objective1 = param1 + param2
-        return {"objective1": objective1}
+        # Calculate objectives
+        # objective1: Higher is better (maximize), peak at x=0, y=0
+        objective1 = np.exp(-(x**2 + y**2)/10)
+
+        # objective2: Lower is better (minimize), valley along y=x
+        objective2 = (x - y)**2
+
+        # objective3: Lower is better (minimize), valley at origin
+        objective3 = np.sqrt(x**2 + y**2)
+
+        # Convert numpy types to Python types to avoid encoding issues
+        return {
+            "objective1": float(objective1),
+            "objective2": float(objective2),
+            "objective3": float(objective3)
+        }
 
     # Initialize and start system components
-    scheduler = SchedulerProcess(coordinator, max_retries=2, worker_timeout_seconds=5.0)
+    scheduler = SchedulerProcess(
+        coordinator,
+        max_retries=2,
+        worker_timeout_seconds=5.0,
+        save_interval=5,  # Save coordinator state every 5 trials
+        save_dir="optimization_results"
+    )
     scheduler_process = mp.Process(target=scheduler.run)
     scheduler_process.start()
 
@@ -1490,7 +1718,7 @@ if __name__ == "__main__":
 
     # Start workers
     processes: list[mp.Process] = []
-    num_workers = 16
+    num_workers = 4  # Reduced number of workers for the simpler problem
     for i in range(num_workers):
         use_ipc = i < num_workers // 2
         p = mp.Process(
@@ -1506,7 +1734,7 @@ if __name__ == "__main__":
         status_socket.connect("ipc:///tmp/scheduler.ipc")
 
         start_time = time.time()
-        max_runtime = 60  # Run for at most 60 seconds
+        max_runtime = 120  # Run for at most 120 seconds (2 minutes)
 
         while time.time() - start_time < max_runtime:
             # Request status from scheduler
@@ -1527,7 +1755,7 @@ if __name__ == "__main__":
                     )
 
                     # End early if we've done enough evaluations
-                    if total_evaluations >= 50:
+                    if total_evaluations >= 50:  # Reduced target for the simpler problem
                         main_logger.info("Reached target number of evaluations")
                         break
             else:

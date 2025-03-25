@@ -34,7 +34,6 @@ types-psutil = "^6.1.0.20241221"
 websockets = "^14.1"
 pytest-asyncio = "^0.25.2"
 python-multipart = "^0.0.20"
-streamlit = "^1.41.1"
 pygmo = "^2.19.5"
 thespian = "^4.0.0"
 fastapi-msgspec = "^0.1.0"
@@ -42,6 +41,7 @@ streamlit-autorefresh = "^1.0.1"
 dash = "^3.0.0"
 jaxtyping = "^0.3.0"
 websocket-client = "^1.8.0"
+marimo = "^0.11.26"
 
 
 [tool.poetry.group.dev.dependencies]
