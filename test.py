@@ -1713,7 +1713,7 @@ if __name__ == "__main__":
     time.sleep(0.5)  # Give scheduler time to start
 
     # Initialize and start server
-    server = Server()
+    server = Server(host="0.0.0.0")
     server.start()
 
     # Start workers
