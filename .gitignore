@@ -174,3 +174,25 @@ cython_debug/
 # Project specific
 temp_optimization/
 stop_optimization.txt
+
+# LaTeX output files
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.lof
+*.lot
+*.out
+*.run.xml
+*.toc
+# Beamer specific
+*.nav
+*.snm
+*.vrb
+# SyncTeX
+*.synctex
+*.synctex.gz
+# Except PDFs which we want to keep
+!*.pdf
