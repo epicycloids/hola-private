@@ -130,7 +130,7 @@ class OptimizationCoordinator:
         - Creates a trial from the evaluation
         - Adds it to the leaderboard
         - Updates elite samples and adaptive sampling
-        - Returns the best trial
+        - Returns the current trial
 
         Note:
         - Trial metadata is stored separately from the main trial data
@@ -143,7 +143,7 @@ class OptimizationCoordinator:
         :type objectives: dict[ObjectiveName, float]
         :param metadata: Optional metadata about the trial
         :type metadata: Optional[Dict[str, Any]]
-        :return: Best trial
+        :return: Current trial
         :rtype: Trial | None
         """
         # Create trial with feasibility check
@@ -167,8 +167,8 @@ class OptimizationCoordinator:
                 )
             )
 
-        # Get the new best objectives
-        return self.get_best_trial()
+        # Get the current trial
+        return trial
 
     def get_total_evaluations(self) -> int:
         """

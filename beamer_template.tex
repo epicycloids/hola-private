@@ -1,0 +1,159 @@
+\documentclass{beamer}
+\usepackage{amsmath}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepackage{bm}
+
+\usetheme{Madrid}
+\usecolortheme{default}
+\setbeamertemplate{navigation symbols}{}
+
+\title{A Light-Weight Multi-Objective Asynchronous\\Hyper-Parameter Optimizer}
+\author{Presentation of HOLA}
+\date{\today}
+
+\begin{document}
+
+\begin{frame}
+    \titlepage
+\end{frame}
+
+\begin{frame}{Problem: Hyper-Parameter Optimization}
+    \begin{itemize}
+        \item Task: Find optimal hyper-parameters $x \in \mathcal{X}=\mathcal{X}_1\times\cdots\times\mathcal{X}_k$
+        \item Multiple objectives to evaluate $x$:
+            \begin{itemize}
+                \item $f_i: \mathcal{X} \to \mathbf{R}$ for $i = 1, \ldots, k$
+                \item Some to minimize, others to maximize
+            \end{itemize}
+        \item Challenges:
+            \begin{itemize}
+                \item Simulations are expensive (black-box)
+                \item No gradients available
+                \item Workers may be unreliable (stragglers, failures)
+                \item Need to balance exploration vs exploitation
+            \end{itemize}
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Multi-Objective Scalarization}
+    \begin{itemize}
+        \item Need to convert multiple objectives into single cost:
+            \[ F(x) = \phi(f(x)) = \phi(f_1(x), \ldots, f_k(x)) \]
+        \item HOLA uses target-priority-limit scalarizer
+            \begin{itemize}
+                \item Separable: $\phi(u) = \sum_{i=1}^k \phi_i(u_i)$
+                \item Each objective characterized by:
+                    \begin{itemize}
+                        \item \textbf{Target} ($T_i$): Ideal value we aim for
+                        \item \textbf{Limit} ($L_i$): Maximum/minimum acceptable value
+                        \item \textbf{Priority} ($P_i$): Relative importance
+                    \end{itemize}
+            \end{itemize}
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Target-Priority-Limit Scalarizer}
+    \begin{columns}
+        \begin{column}{0.5\textwidth}
+            \textbf{For minimization objective:}
+            \[ \phi_i(u_i) = \begin{cases}
+                0 & u_i \leq T_i \\
+                P_i\frac{u_i-T_i}{L_i-T_i} & T_i \leq u_i \leq L_i \\
+                +\infty & u_i > L_i
+            \end{cases} \]
+
+            \textbf{For maximization objective:}
+            \[ \phi_i(u_i) = \begin{cases}
+                0 & u_i \geq T_i \\
+                P_i\frac{T_i-u_i}{T_i-L_i} & L_i \leq u_i \leq T_i \\
+                +\infty & u_i < L_i
+            \end{cases} \]
+        \end{column}
+        \begin{column}{0.5\textwidth}
+            \begin{tikzpicture}
+                \begin{axis}[
+                    width=\textwidth,
+                    height=5cm,
+                    axis lines=middle,
+                    xlabel=$u_i$,
+                    ylabel=$\phi_i(u_i)$,
+                    xmin=0, xmax=10,
+                    ymin=-0.2, ymax=1.2,
+                    xtick={2,7},
+                    xticklabels={$T_i$,$L_i$},
+                    ytick={0,0.5,1},
+                    yticklabels={0,0.5,1},
+                    title={Minimization Objective}
+                ]
+                \addplot[domain=0:2, blue, thick] {0};
+                \addplot[domain=2:7, blue, thick] {(x-2)/(7-2)};
+
+                % Draw vertical line at x=8 to indicate discontinuity
+                \draw[thick, red, dashed] (axis cs:7,0) -- (axis cs:7,1.2);
+
+                % Add infinity symbol and arrow
+                \draw[-, thick] (axis cs:7,1.2) -- (axis cs:8.5,1.2);
+                \node[right] at (axis cs:7.5,1.1) {$+\infty$};
+                \end{axis}
+            \end{tikzpicture}
+        \end{column}
+    \end{columns}
+    \begin{itemize}
+        \item Overall cost: $F(x) = \sum_{i=1}^k \phi_i(f_i(x))$
+        \item Intuitively: 0 cost when better than target, infinite cost when worse than limit
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Hyper-Parameter Attributes}
+    Standardizing hyper-parameters for sampling:
+    \begin{itemize}
+        \item \textbf{Range}: Min/max values $l_i$ and $u_i$
+        \item \textbf{Scale}: Linear or logarithmic
+        \item \textbf{Grid/discrete}: Finite set of values
+    \end{itemize}
+
+    \vspace{0.3cm}
+    \textbf{Standardization}: Map each parameter to $z_i \in [0,1]$
+    \begin{itemize}
+        \item Linear scale: $z_i = \frac{x_i-l_i}{u_i-l_i}$
+        \item Log scale: $z_i = \frac{\log x_i-\log l_i}{\log u_i- \log l_i}$
+    \end{itemize}
+
+    This standardizes the sample space, while respecting original constraints.
+\end{frame}
+
+\begin{frame}{Optimization Method}
+    \textbf{Asynchronous exploration strategy:}
+    \begin{enumerate}
+        \item \textbf{Initial phase}: Uniform sampling (or Sobol' sequence) until threshold
+        \item \textbf{Elite points}: Track top $r = \eta K$ simulations (e.g., $\eta = 0.2$)
+        \item \textbf{Statistical model}: Fit Gaussian mixture model to elite points
+        \item \textbf{Sample}: Generate new suggestions from the model
+    \end{enumerate}
+\end{frame}
+
+\begin{frame}{Comparison Groups and Pareto Ranking}
+    \begin{itemize}
+        \item \textbf{Comparison Groups}: Group comparable objectives together
+            \begin{itemize}
+                \item Each objective belongs to a comparison group
+                \item Within a group: Combine using priority-weighted sums
+                \item Example: $\Phi_g(x) = \sum_{i \in \text{group } g} \phi_i(f_i(x))$
+            \end{itemize}
+        \item \textbf{Pareto/Nondominance Ranking}:
+            \begin{itemize}
+                \item Calculate group scores: $\Phi(x) = (\Phi_1(x), \Phi_2(x), \ldots, \Phi_G(x))$
+                \item Solution $x$ dominates $y$ if:
+                    \begin{itemize}
+                        \item For all groups $g$: $\Phi_g(x) \leq \Phi_g(y)$
+                        \item For at least one group $g$: $\Phi_g(x) < \Phi_g(y)$
+                    \end{itemize}
+                \item Solutions ranked by their Pareto front level
+                \item Elite set selected across multiple Pareto fronts
+            \end{itemize}
+    \end{itemize}
+\end{frame}
+
+\end{document}
