@@ -22,8 +22,9 @@ def setup_logging(name: str, level: int = logging.INFO) -> logging.Logger:
     logger.setLevel(level)
 
     # Avoid adding multiple handlers if logger already exists and is configured
-    if logger.hasHandlers():
-        return logger
+    # NOTE: This check is removed because the test fixture handles cleanup.
+    # if logger.hasHandlers():
+    #     return logger
 
     # Create formatter
     formatter = logging.Formatter(

@@ -244,7 +244,8 @@ class SchedulerProcess:
                     message_bytes = heartbeat_socket.recv()
                     try:
                         # Use Message union type from .messages
-                        message = msgspec.json.decode(message_bytes, type=Message)
+                        # Decode using msgpack for ZMQ
+                        message = msgspec.msgpack.decode(message_bytes, type=Message)
 
                         if isinstance(message, HeartbeatRequest):
                             worker_id = message.worker_id
@@ -255,16 +256,18 @@ class SchedulerProcess:
                                     f"Received heartbeat from worker {worker_id}"
                                 )
                                 # Use HeartbeatResponse from .messages
+                                # Encode using msgpack for ZMQ
                                 heartbeat_socket.send(
-                                    msgspec.json.encode(HeartbeatResponse(success=True))
+                                    msgspec.msgpack.encode(HeartbeatResponse(success=True))
                                 )
                             else:
                                 # Worker not recognized - might have been removed due to timeout
                                 self.logger.warning(
                                     f"Heartbeat from unknown worker {worker_id}"
                                 )
+                                # Encode using msgpack for ZMQ
                                 heartbeat_socket.send(
-                                    msgspec.json.encode(
+                                    msgspec.msgpack.encode(
                                         HeartbeatResponse(success=False)
                                     )
                                 )
@@ -273,93 +276,66 @@ class SchedulerProcess:
                             self.logger.warning(
                                 f"Received non-heartbeat message on heartbeat socket: {type(message)}"
                             )
+                             # Encode using msgpack for ZMQ (though this is an error case)
                             heartbeat_socket.send(
-                                msgspec.json.encode(
+                                msgspec.msgpack.encode(
                                     {"error": "Expected heartbeat message"}
                                 )
                             )
                     except Exception as e:
                         self.logger.error(f"Error processing heartbeat: {e}")
-                        heartbeat_socket.send(msgspec.json.encode({"error": str(e)}))
+                        # Encode using msgpack for ZMQ (error case)
+                        heartbeat_socket.send(msgspec.msgpack.encode({"error": str(e)}))
 
                 # Handle main messages
                 if main_socket in socks and socks[main_socket] == zmq.POLLIN:
                     message_bytes = main_socket.recv()
                     try:
                         # Use Message union type from .messages
-                        message = msgspec.json.decode(message_bytes, type=Message)
-                    except ValueError:
-                        # Try to parse as generic JSON if structured parsing fails
-                        try:
-                            message_dict = msgspec.json.decode(message_bytes)
-                            tag = message_dict.get("tag", "unknown")
-                            # Use message types from .messages
-                            if tag == "get_suggestion":
-                                message = GetSuggestionRequest(
-                                    worker_id=message_dict.get("worker_id", -1)
-                                )
-                            elif tag == "submit_result":
-                                result_dict = message_dict.get("result", {})
-                                result = Result(
-                                    parameters=result_dict.get("parameters", {}),
-                                    objectives=result_dict.get("objectives", {}),
-                                )
-                                message = SubmitResultRequest(
-                                    worker_id=message_dict.get("worker_id", -1),
-                                    result=result,
-                                )
-                            elif tag == "shutdown":
-                                message = ShutdownRequest()
-                            elif tag == "status":
-                                message = StatusRequest()
-                            elif tag == "get_trials":
-                                message = GetTrialsRequest(
-                                    ranked_only=message_dict.get("ranked_only", True)
-                                )
-                            elif tag == "get_metadata":
-                                message = GetMetadataRequest(
-                                    trial_ids=message_dict.get("trial_ids")
-                                )
-                            elif tag == "get_top_k":
-                                message = GetTopKRequest(k=message_dict.get("k", 1))
-                            elif tag == "is_multi_group":
-                                message = IsMultiGroupRequest()
-                            else:
-                                # Unknown message type, reply with error
-                                main_socket.send(
-                                    msgspec.json.encode(
-                                        {"error": f"Unknown message type: {tag}"}
-                                    )
-                                )
-                                continue
-                        except Exception as e:
-                            self.logger.error(f"Failed to parse message: {e}")
-                            main_socket.send(
-                                msgspec.json.encode(
-                                    {"error": f"Failed to parse message: {str(e)}"}
-                                )
+                        # Decode using msgpack for ZMQ
+                        message = msgspec.msgpack.decode(message_bytes, type=Message)
+                    except (msgspec.DecodeError, ValueError) as e: # Catch msgpack decode errors
+                        # Try to parse as generic JSON if structured parsing fails (Maybe keep this for flexibility? Or enforce msgpack?)
+                        # For now, let's assume ZMQ uses msgpack consistently.
+                        self.logger.error(f"Failed to decode msgpack message: {e}")
+                        # Encode using msgpack for ZMQ
+                        main_socket.send(
+                            msgspec.msgpack.encode(
+                                {"error": f"Failed to decode msgpack message: {str(e)}"}
                             )
-                            continue
+                        )
+                        continue
+                        # Original JSON fallback logic commented out:
+                        # try:
+                        #     message_dict = msgspec.json.decode(message_bytes)
+                        #     # ... (rest of JSON fallback) ...
+                        # except Exception as json_e:
+                        #     self.logger.error(f"Failed to parse message as msgpack or JSON: {e}; {json_e}")
+                        #     main_socket.send(
+                        #         msgspec.msgpack.encode(
+                        #             {"error": f"Failed to parse message: {str(e)}; {str(json_e)}"}
+                        #         )
+                        #     )
+                        #     continue
 
                     match message:
                         case GetSuggestionRequest():
                             # Register or update worker state
                             worker_id = message.worker_id
 
-                            # Track and log new workers
-                            if worker_id not in self.last_seen_worker_ids:
-                                self.last_seen_worker_ids.add(worker_id)
+                            # Check if worker is truly new before logging and adding
+                            if worker_id not in self.workers:
+                                # Log first contact only for truly new workers
+                                self.last_seen_worker_ids.add(worker_id) # Keep track if needed elsewhere
                                 self.logger.info(
                                     f"First contact from worker {worker_id}"
                                 )
-
-                            if worker_id not in self.workers:
-                                # Use WorkerState defined above
                                 self.workers[worker_id] = WorkerState(worker_id)
                                 self.logger.info(
                                     f"New worker registered: {worker_id}. Total active workers: {len(self.workers)}"
                                 )
                             else:
+                                # Existing worker, just update heartbeat
                                 self.workers[worker_id].update_heartbeat()
 
                             # Check retry queue first
@@ -377,7 +353,7 @@ class SchedulerProcess:
 
                             # Use GetSuggestionResponse from .messages
                             response = GetSuggestionResponse(parameters=params)
-                            main_socket.send(msgspec.json.encode(response))
+                            main_socket.send(msgspec.msgpack.encode(response))
 
                         case SubmitResultRequest():
                             worker_id = message.worker_id
@@ -412,7 +388,7 @@ class SchedulerProcess:
                                     success=False, error="Worker not recognized"
                                 )
 
-                            main_socket.send(msgspec.json.encode(response))
+                            main_socket.send(msgspec.msgpack.encode(response))
 
                         case ShutdownRequest():
                             # Save coordinator state before shutting down
@@ -421,7 +397,7 @@ class SchedulerProcess:
                             self.running = False
                             # Use SubmitResultResponse from .messages (though content doesn't matter much)
                             main_socket.send(
-                                msgspec.json.encode(SubmitResultResponse(success=True))
+                                msgspec.msgpack.encode(SubmitResultResponse(success=True))
                             )
 
                         case StatusRequest():
@@ -436,7 +412,7 @@ class SchedulerProcess:
                                     total_evaluations=self.coordinator.get_total_evaluations(),
                                     best_objectives=best_objectives,
                                 )
-                                main_socket.send(msgspec.json.encode(response))
+                                main_socket.send(msgspec.msgpack.encode(response))
                             except Exception as e:
                                 self.logger.error(
                                     f"Error creating status response: {e}"
@@ -446,7 +422,7 @@ class SchedulerProcess:
                                     total_evaluations=0,
                                     best_objectives=None,
                                 )
-                                main_socket.send(msgspec.json.encode(error_response))
+                                main_socket.send(msgspec.msgpack.encode(error_response))
 
                         case GetTrialsRequest():
                             try:
@@ -461,11 +437,11 @@ class SchedulerProcess:
                                 trials_list = df.reset_index().to_dict(orient="records")
                                 # Use GetTrialsResponse from .messages
                                 response = GetTrialsResponse(trials=trials_list)
-                                main_socket.send(msgspec.json.encode(response))
+                                main_socket.send(msgspec.msgpack.encode(response))
                             except Exception as e:
                                 self.logger.error(f"Error getting trials: {e}")
                                 main_socket.send(
-                                    msgspec.json.encode(GetTrialsResponse(trials=[]))
+                                    msgspec.msgpack.encode(GetTrialsResponse(trials=[]))
                                 )
 
                         case GetMetadataRequest():
@@ -481,11 +457,11 @@ class SchedulerProcess:
                                     metadata_list.append(metadata_dict)
                                 # Use GetMetadataResponse from .messages
                                 response = GetMetadataResponse(metadata=metadata_list)
-                                main_socket.send(msgspec.json.encode(response))
+                                main_socket.send(msgspec.msgpack.encode(response))
                             except Exception as e:
                                 self.logger.error(f"Error getting metadata: {e}")
                                 main_socket.send(
-                                    msgspec.json.encode(
+                                    msgspec.msgpack.encode(
                                         GetMetadataResponse(metadata=[])
                                     )
                                 )
@@ -508,11 +484,11 @@ class SchedulerProcess:
                                     trial_dicts.append(trial_dict)
                                 # Use GetTopKResponse from .messages
                                 response = GetTopKResponse(trials=trial_dicts)
-                                main_socket.send(msgspec.json.encode(response))
+                                main_socket.send(msgspec.msgpack.encode(response))
                             except Exception as e:
                                 self.logger.error(f"Error getting top k trials: {e}")
                                 main_socket.send(
-                                    msgspec.json.encode(GetTopKResponse(trials=[]))
+                                    msgspec.msgpack.encode(GetTopKResponse(trials=[]))
                                 )
 
                         case IsMultiGroupRequest():
@@ -520,19 +496,20 @@ class SchedulerProcess:
                                 is_multi = self.coordinator.is_multi_group()
                                 # Use IsMultiGroupResponse from .messages
                                 response = IsMultiGroupResponse(is_multi_group=is_multi)
-                                main_socket.send(msgspec.json.encode(response))
+                                main_socket.send(msgspec.msgpack.encode(response))
                             except Exception as e:
                                 self.logger.error(f"Error checking multi group: {e}")
                                 main_socket.send(
-                                    msgspec.json.encode(
+                                    msgspec.msgpack.encode(
                                         IsMultiGroupResponse(is_multi_group=False)
                                     )
                                 )
 
                         case _:
                             self.logger.error(f"Unknown message type: {type(message)}")
+                            # Ensure response is msgpack encoded
                             main_socket.send(
-                                msgspec.json.encode(
+                                msgspec.msgpack.encode(
                                     {"error": f"Unknown message type: {type(message)}"}
                                 )
                             )
@@ -542,7 +519,8 @@ class SchedulerProcess:
                 try:
                     # If we're handling the main socket, respond there
                     if "main_socket" in locals() and "message" in locals():
-                        main_socket.send(msgspec.json.encode({"error": str(e)}))
+                         # Ensure response is msgpack encoded
+                        main_socket.send(msgspec.msgpack.encode({"error": str(e)}))
                 except:
                     pass
 

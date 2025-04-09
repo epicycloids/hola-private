@@ -68,42 +68,38 @@ class Server:
         self.server_thread = None
 
     def setup_rest_routes(self) -> None:
-        @self.rest_app.get("/suggestion", response_model=None)
-        async def get_job() -> bytes:
+        @self.rest_app.get("/suggestion")
+        async def get_job():
             try:
                 # Assign a unique negative worker ID for REST API clients
                 # (to distinguish from local workers which have positive IDs)
                 worker_id = -int(time.time() % 100000)
                 # Use ZMQ request type from .messages
                 request = GetSuggestionRequest(worker_id=worker_id)
-                self.socket.send(msgspec.json.encode(request))
+                # Use msgpack for ZMQ socket
+                self.socket.send(msgspec.msgpack.encode(request))
 
-                # Use Message union type from .messages
-                response = msgspec.json.decode(self.socket.recv(), type=Message)
+                # Use msgpack for ZMQ socket
+                response = msgspec.msgpack.decode(self.socket.recv(), type=Message)
                 match response:
                     # Use ZMQ response type from .messages
                     case GetSuggestionResponse(parameters=params):
-                        # Use REST response type from .messages
-                        return msgspec.json.encode(
-                            RESTGetSuggestionResponse(parameters=params)
-                        )
+                        rest_response = RESTGetSuggestionResponse(parameters=params)
+                        return msgspec.to_builtins(rest_response)
                     case _:
-                        return msgspec.json.encode(
-                            RESTGetSuggestionResponse(
-                                parameters=None,
-                                error="Unexpected response from scheduler",
-                            )
+                        rest_response = RESTGetSuggestionResponse(
+                            parameters=None, error="Unexpected response from scheduler"
                         )
+                        return msgspec.to_builtins(rest_response)
 
             except Exception as e:
-                return msgspec.json.encode(
-                    RESTGetSuggestionResponse(
-                        parameters=None, error=f"Error getting job: {str(e)}"
-                    )
+                rest_response = RESTGetSuggestionResponse(
+                    parameters=None, error=f"Error getting job: {str(e)}"
                 )
+                return msgspec.to_builtins(rest_response)
 
-        @self.rest_app.post("/result", response_model=None)
-        async def submit_result(request: Request) -> bytes:
+        @self.rest_app.post("/result")
+        async def submit_result(request: Request):
             try:
                 # Decode the raw request body using msgspec
                 body = await request.body()
@@ -118,71 +114,65 @@ class Server:
                 )
                 # Use ZMQ request type from .messages
                 zmq_request = SubmitResultRequest(worker_id=worker_id, result=result_obj)
-                self.socket.send(msgspec.json.encode(zmq_request))
+                # Use msgpack for ZMQ socket
+                self.socket.send(msgspec.msgpack.encode(zmq_request))
 
                 # Get response from scheduler
-                # Use Message union type from .messages
-                response = msgspec.json.decode(self.socket.recv(), type=Message)
+                # Use msgpack for ZMQ socket
+                response = msgspec.msgpack.decode(self.socket.recv(), type=Message)
 
                 match response:
                     # Use ZMQ response type from .messages
                     case SubmitResultResponse(
                         success=success, is_best=is_best, error=error
                     ):
-                        # Use REST response type from .messages
-                        return msgspec.json.encode(
-                            RESTSubmitResponse(success=success, error=error)
-                        )
+                        rest_response = RESTSubmitResponse(success=success, error=error)
+                        return msgspec.to_builtins(rest_response)
                     case _:
-                        return msgspec.json.encode(
-                            RESTSubmitResponse(
-                                success=False,
-                                error="Unexpected response from scheduler",
-                            )
+                        rest_response = RESTSubmitResponse(
+                            success=False,
+                            error="Unexpected response from scheduler",
                         )
+                        return msgspec.to_builtins(rest_response)
 
             except Exception as e:
                 self.logger.error(f"Error in submit_result: {e}")
-                return msgspec.json.encode(
-                    RESTSubmitResponse(
-                        success=False, error=f"Error submitting result: {str(e)}"
-                    )
+                rest_response = RESTSubmitResponse(
+                    success=False, error=f"Error submitting result: {str(e)}"
                 )
+                return msgspec.to_builtins(rest_response)
 
-        @self.rest_app.post("/shutdown", response_model=None)
-        async def shutdown_scheduler() -> bytes: # Renamed for clarity
+        @self.rest_app.post("/shutdown")
+        async def shutdown_scheduler():
             try:
                 # Use ZMQ request type from .messages
                 request = ShutdownRequest()
-                self.socket.send(msgspec.json.encode(request))
+                # Use msgpack for ZMQ socket
+                self.socket.send(msgspec.msgpack.encode(request))
 
-                # Use Message union type from .messages
-                response = msgspec.json.decode(self.socket.recv(), type=Message)
+                # Use msgpack for ZMQ socket
+                response = msgspec.msgpack.decode(self.socket.recv(), type=Message)
 
                 match response:
                     # Use ZMQ response type from .messages
                     case SubmitResultResponse(success=success, error=error):
-                         # Use REST response type from .messages
-                        return msgspec.json.encode(
-                            RESTSubmitResponse(success=success, error=error)
-                        )
+                        rest_response = RESTSubmitResponse(success=success, error=error)
+                        return msgspec.to_builtins(rest_response)
                     case _:
-                        return msgspec.json.encode(
-                            RESTSubmitResponse(
-                                success=False,
-                                error="Unexpected response from scheduler",
-                            )
+                        rest_response = RESTSubmitResponse(
+                            success=False,
+                            error="Unexpected response from scheduler",
                         )
+                        return msgspec.to_builtins(rest_response)
             except Exception as e:
                 self.logger.error(f"Error in shutdown request: {e}")
-                return msgspec.json.encode(
-                    RESTSubmitResponse(
-                        success=False, error=f"Error shutting down: {str(e)}"
-                    )
+                rest_response = RESTSubmitResponse(
+                    success=False, error=f"Error shutting down: {str(e)}"
                 )
+                return msgspec.to_builtins(rest_response)
 
-        @self.rest_app.post("/heartbeat", response_model=None)
-        async def send_heartbeat(request: Request) -> bytes:
+        @self.rest_app.post("/heartbeat")
+        async def send_heartbeat(request: Request):
             try:
                 body = await request.body()
                  # Use REST request type from .messages
@@ -191,65 +181,59 @@ class Server:
                 worker_id = heartbeat_req.worker_id
                 # Use ZMQ request type from .messages
                 zmq_request = HeartbeatRequest(worker_id=worker_id)
-                self.socket.send(msgspec.json.encode(zmq_request))
+                # Use msgpack for ZMQ socket
+                self.socket.send(msgspec.msgpack.encode(zmq_request))
 
-                # Use Message union type from .messages
-                response = msgspec.json.decode(self.socket.recv(), type=Message)
+                # Use msgpack for ZMQ socket
+                response = msgspec.msgpack.decode(self.socket.recv(), type=Message)
 
                 match response:
                      # Use ZMQ response type from .messages
                     case HeartbeatResponse(success=success):
-                         # Use REST response type from .messages
-                        return msgspec.json.encode(
-                            RESTHeartbeatResponse(success=success)
-                        )
+                        rest_response = RESTHeartbeatResponse(success=success)
+                        return msgspec.to_builtins(rest_response)
                     case _:
-                        return msgspec.json.encode(
-                            RESTHeartbeatResponse(
-                                success=False,
-                                error="Unexpected response from scheduler"
-                            )
+                        rest_response = RESTHeartbeatResponse(
+                            success=False,
+                            error="Unexpected response from scheduler"
                         )
+                        return msgspec.to_builtins(rest_response)
             except Exception as e:
                 self.logger.error(f"Error in heartbeat: {e}")
-                return msgspec.json.encode(
-                    RESTHeartbeatResponse(
-                        success=False, error=f"Error sending heartbeat: {str(e)}"
-                    )
+                rest_response = RESTHeartbeatResponse(
+                    success=False, error=f"Error sending heartbeat: {str(e)}"
                 )
+                return msgspec.to_builtins(rest_response)
 
-        @self.rest_app.get("/trials", response_model=None)
-        async def get_trials(ranked_only: bool = True) -> bytes:
+        @self.rest_app.get("/trials")
+        async def get_trials(ranked_only: bool = True):
             try:
                 # Use ZMQ request type from .messages
                 request = GetTrialsRequest(ranked_only=ranked_only)
-                self.socket.send(msgspec.json.encode(request))
+                # Use msgpack for ZMQ socket
+                self.socket.send(msgspec.msgpack.encode(request))
 
-                # Use Message union type from .messages
-                response = msgspec.json.decode(self.socket.recv(), type=Message)
+                # Use msgpack for ZMQ socket
+                response = msgspec.msgpack.decode(self.socket.recv(), type=Message)
 
                 match response:
                     # Use ZMQ response type from .messages
                     case GetTrialsResponse(trials=trials):
-                         # Use REST response type from .messages
-                        return msgspec.json.encode(
-                            RESTGetTrialsResponse(trials=trials)
-                        )
+                        rest_response = RESTGetTrialsResponse(trials=trials)
+                        return msgspec.to_builtins(rest_response)
                     case _:
-                        return msgspec.json.encode(
-                            RESTGetTrialsResponse(
-                                trials=[],
-                                error="Unexpected response from scheduler"
-                            )
+                        rest_response = RESTGetTrialsResponse(
+                            trials=[],
+                            error="Unexpected response from scheduler"
                         )
+                        return msgspec.to_builtins(rest_response)
             except Exception as e:
                 self.logger.error(f"Error getting trials: {e}")
-                return msgspec.json.encode(
-                    RESTGetTrialsResponse(trials=[], error=f"Error: {str(e)}")
-                )
+                rest_response = RESTGetTrialsResponse(trials=[], error=f"Error: {str(e)}")
+                return msgspec.to_builtins(rest_response)
 
-        @self.rest_app.get("/metadata", response_model=None)
-        async def get_metadata(trial_ids: Optional[str] = None) -> bytes:
+        @self.rest_app.get("/metadata")
+        async def get_metadata(trial_ids: Optional[str] = None):
             try:
                 # Convert string parameter to list of integers if provided
                 parsed_trial_ids = None
@@ -261,98 +245,88 @@ class Server:
                         else:
                             parsed_trial_ids = int(trial_ids)
                     except ValueError:
-                        return msgspec.json.encode(
-                            RESTGetMetadataResponse(
-                                metadata=[],
-                                error="Invalid trial_ids format: must be an integer or comma-separated integers"
-                            )
+                        rest_response = RESTGetMetadataResponse(
+                            metadata=[],
+                            error="Invalid trial_ids format: must be an integer or comma-separated integers"
                         )
+                        return msgspec.to_builtins(rest_response)
                 # Use ZMQ request type from .messages
                 request = GetMetadataRequest(trial_ids=parsed_trial_ids)
-                self.socket.send(msgspec.json.encode(request))
+                # Use msgpack for ZMQ socket
+                self.socket.send(msgspec.msgpack.encode(request))
 
-                # Use Message union type from .messages
-                response = msgspec.json.decode(self.socket.recv(), type=Message)
+                # Use msgpack for ZMQ socket
+                response = msgspec.msgpack.decode(self.socket.recv(), type=Message)
 
                 match response:
                     # Use ZMQ response type from .messages
                     case GetMetadataResponse(metadata=metadata):
-                         # Use REST response type from .messages
-                        return msgspec.json.encode(
-                            RESTGetMetadataResponse(metadata=metadata)
-                        )
+                        rest_response = RESTGetMetadataResponse(metadata=metadata)
+                        return msgspec.to_builtins(rest_response)
                     case _:
-                        return msgspec.json.encode(
-                            RESTGetMetadataResponse(
-                                metadata=[],
-                                error="Unexpected response from scheduler"
-                            )
+                        rest_response = RESTGetMetadataResponse(
+                            metadata=[],
+                            error="Unexpected response from scheduler"
                         )
+                        return msgspec.to_builtins(rest_response)
             except Exception as e:
                 self.logger.error(f"Error getting metadata: {e}")
-                return msgspec.json.encode(
-                    RESTGetMetadataResponse(metadata=[], error=f"Error: {str(e)}")
-                )
+                rest_response = RESTGetMetadataResponse(metadata=[], error=f"Error: {str(e)}")
+                return msgspec.to_builtins(rest_response)
 
-        @self.rest_app.get("/top", response_model=None)
-        async def get_top_k(k: int = 1) -> bytes:
+        @self.rest_app.get("/top")
+        async def get_top_k(k: int = 1):
             try:
                 # Use ZMQ request type from .messages
                 request = GetTopKRequest(k=k)
-                self.socket.send(msgspec.json.encode(request))
+                # Use msgpack for ZMQ socket
+                self.socket.send(msgspec.msgpack.encode(request))
 
-                # Use Message union type from .messages
-                response = msgspec.json.decode(self.socket.recv(), type=Message)
+                # Use msgpack for ZMQ socket
+                response = msgspec.msgpack.decode(self.socket.recv(), type=Message)
 
                 match response:
                     # Use ZMQ response type from .messages
                     case GetTopKResponse(trials=trials):
-                         # Use REST response type from .messages
-                        return msgspec.json.encode(
-                            RESTGetTopKResponse(trials=trials)
-                        )
+                        rest_response = RESTGetTopKResponse(trials=trials)
+                        return msgspec.to_builtins(rest_response)
                     case _:
-                        return msgspec.json.encode(
-                            RESTGetTopKResponse(
-                                trials=[],
-                                error="Unexpected response from scheduler"
-                            )
+                        rest_response = RESTGetTopKResponse(
+                            trials=[],
+                            error="Unexpected response from scheduler"
                         )
+                        return msgspec.to_builtins(rest_response)
             except Exception as e:
                 self.logger.error(f"Error getting top k trials: {e}")
-                return msgspec.json.encode(
-                    RESTGetTopKResponse(trials=[], error=f"Error: {str(e)}")
-                )
+                rest_response = RESTGetTopKResponse(trials=[], error=f"Error: {str(e)}")
+                return msgspec.to_builtins(rest_response)
 
-        @self.rest_app.get("/is_multi_group", response_model=None)
-        async def is_multi_group() -> bytes:
+        @self.rest_app.get("/is_multi_group")
+        async def is_multi_group():
             try:
                 # Use ZMQ request type from .messages
                 request = IsMultiGroupRequest()
-                self.socket.send(msgspec.json.encode(request))
+                # Use msgpack for ZMQ socket
+                self.socket.send(msgspec.msgpack.encode(request))
 
-                # Use Message union type from .messages
-                response = msgspec.json.decode(self.socket.recv(), type=Message)
+                # Use msgpack for ZMQ socket
+                response = msgspec.msgpack.decode(self.socket.recv(), type=Message)
 
                 match response:
                     # Use ZMQ response type from .messages
                     case IsMultiGroupResponse(is_multi_group=is_multi):
-                         # Use REST response type from .messages
-                        return msgspec.json.encode(
-                            RESTIsMultiGroupResponse(is_multi_group=is_multi)
-                        )
+                        rest_response = RESTIsMultiGroupResponse(is_multi_group=is_multi)
+                        return msgspec.to_builtins(rest_response)
                     case _:
-                        return msgspec.json.encode(
-                            RESTIsMultiGroupResponse(
-                                is_multi_group=False,
-                                error="Unexpected response from scheduler"
-                            )
+                        rest_response = RESTIsMultiGroupResponse(
+                            is_multi_group=False,
+                            error="Unexpected response from scheduler"
                         )
+                        return msgspec.to_builtins(rest_response)
             except Exception as e:
                 self.logger.error(f"Error checking multi group: {e}")
-                return msgspec.json.encode(
-                    RESTIsMultiGroupResponse(is_multi_group=False, error=f"Error: {str(e)}")
-                )
+                rest_response = RESTIsMultiGroupResponse(is_multi_group=False, error=f"Error: {str(e)}")
+                return msgspec.to_builtins(rest_response)
 
         @self.rest_app.get("/history")
         async def get_history():
@@ -360,9 +334,10 @@ class Server:
             try:
                 # Get current status from scheduler
                 # Use ZMQ request type from .messages
-                self.socket.send(msgspec.json.encode(StatusRequest()))
-                 # Use Message union type from .messages
-                status_response = msgspec.json.decode(self.socket.recv(), type=Message)
+                # Use msgpack for ZMQ socket
+                self.socket.send(msgspec.msgpack.encode(StatusRequest()))
+                 # Use msgpack for ZMQ socket
+                status_response = msgspec.msgpack.decode(self.socket.recv(), type=Message)
 
                 if not isinstance(status_response, StatusResponse):
                     return {"error": "Failed to get status from scheduler"}
@@ -386,10 +361,11 @@ class Server:
                 self.logger.info("Received status request")
                 # Use ZMQ request type from .messages
                 request = StatusRequest()
-                self.socket.send(msgspec.json.encode(request))
+                # Use msgpack for ZMQ socket
+                self.socket.send(msgspec.msgpack.encode(request))
 
-                # Use Message union type from .messages
-                response = msgspec.json.decode(self.socket.recv(), type=Message)
+                # Use msgpack for ZMQ socket
+                response = msgspec.msgpack.decode(self.socket.recv(), type=Message)
 
                 match response:
                     # Use ZMQ response type from .messages

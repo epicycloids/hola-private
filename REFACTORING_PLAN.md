@@ -93,16 +93,66 @@ This plan outlines the steps to refactor the distributed components from `test.p
 
 - [ ] **9. Refinement and Cleanup (Post-Move):**
     - **Goal:** Address remaining inconsistencies, potential improvements, and documentation after the structural changes are complete.
-    - **Unit Testing:** Implement comprehensive unit tests for the new distributed components (`scheduler`, `worker`, `server`, `messages`, `utils`) to ensure correctness and prevent regressions.
-    - **Docstring Style:** Ensure all docstrings in the new modules adhere to the reStructuredText (reST) format compatible with Sphinx, matching the style of the existing `hola.core` modules.
-    - **Convenience Entrypoint:** Create a high-level function (e.g., `run_local_distributed`) that simplifies running an optimization locally using the distributed components. This function should accept the objective function, parameter/objective configuration, number of workers, and manage the setup/teardown of the scheduler and local workers.
-    - **Redundancy (REST vs ZMQ Messages):** Review the duplicated message definitions in `messages.py`. Consider if REST responses can directly use or adapt ZMQ structs to reduce code.
-    - **Worker ID for REST:** Evaluate the temporary negative `worker_id` assignment in `Server`. Consider if a more robust UUID or registration mechanism is needed.
-    - **Configuration:** Identify hardcoded values (ZMQ addresses, ports, timeouts, save intervals) in `scheduler.py`, `worker.py`, `server.py`, and `run_distributed.py`. Plan to move these into configuration objects (e.g., dataclasses, Pydantic models) for better flexibility.
-    - **Error Handling:** Review error handling loops (like `MAX_CONSECUTIVE_ERRORS`) for consistency and robustness.
-    - **Imports:** Perform a final check of all relative and absolute imports across all modified and new files.
-    - **Docstrings (Module/Class Level):** Add module-level docstrings to the new files (`messages.py`, `scheduler.py`, etc.). Review and update existing docstrings for classes and functions that were moved.
+
+    **Phase 1: Testing Foundation (Partially Complete)**
+    - [x] **9.1 Setup Testing Framework:**
+        - Chosen: `pytest`.
+        - Structure: `tests/distributed/` created.
+        - Configured via `pyproject.toml`.
+    - [x] **9.2 Test `messages.py`:**
+        - Basic serialization/deserialization tests added and passing.
+        - TODO: Add tests for edge cases if necessary.
+    - [x] **9.3 Test `utils.py` (`setup_logging`):**
+        - Tests added using mocking, passing.
+    - [x] **9.4 Test `WorkerState` (`scheduler.py`):**
+        - Tests added for initialization and methods, passing.
+    - [ ] **9.5 Test `LocalWorker` (`worker.py`): POSTPONED**
+        - Initial tests written but commented out due to complex mocking issues (threading/ZMQ interaction).
+        - **Remaining Work:** Revisit mocking strategy, implement tests for:
+            - Basic run loop success path.
+            - Loop termination (no suggestions).
+            - Error handling (ZMQ errors, eval function errors, max errors).
+            - `send_heartbeats` logic.
+            - `evaluate_parameters` edge cases.
+    - [ ] **9.6 Test `SchedulerProcess` (`scheduler.py`): PARTIALLY COMPLETE**
+        - Tests added and passing for:
+            - Initialization.
+            - Basic message handling (`Heartbeat`, `GetSuggestion`, `SubmitResult`, `Shutdown`, `Status`, `GetTrials`, `GetMetadata`, `GetTopK`, `IsMultiGroup`).
+        - **Remaining Work:**
+            - Test error handling during message processing (e.g., decode errors, coordinator errors).
+            - Test `check_worker_timeouts` thoroughly (POSTPONED due to mocking difficulty).
+            - Test `save_coordinator_state` file interactions.
+    - [x] **9.7 Test `Server` (`server.py`):**
+        - Tests added for all endpoints using `TestClient`, passing.
+        - **Remaining Work:** Add tests for error conditions (e.g., ZMQ errors returned to client, bad request data variations).
+
+    **Phase 2: Code Style and Readability (Not Started)**
+    - [ ] **9.8 Docstring Style and Content:**
+        - Review/update docstrings in `hola/distributed/*` for reST compliance (`:param:`, `:return:`, etc.).
+        - Add module-level docstrings.
+    - [ ] **9.9 Type Hinting:**
+        - Review/improve type hints in `hola/distributed/*`.
+    - [ ] **9.10 Code Formatting and Linting:**
+        - Run `black`, `isort`, `flake8` on `hola/distributed/*`.
+    - [ ] **9.10a Remove Temporary Inline Comments:**
+        - Remove developer comments added during refactoring.
+
+    **Phase 3: Configuration and API (Not Started)**
+    - [ ] **9.11 Configuration Management:**
+        - Refactor hardcoded values (ZMQ addresses, ports, timeouts, etc.) into config objects.
+    - [ ] **9.12 Convenience Entrypoint (`run_local_distributed`):**
+        - Implement the simplified local runner function.
+    - [ ] **9.13 API Review (REST vs ZMQ Messages):**
+        - Evaluate potential for reducing message struct duplication.
+    - [ ] **9.14 Error Handling Review:**
+        - Perform a holistic review of error handling and logging consistency.
+
+    **Phase 4: Final Checks (Not Started)**
+    - [ ] **9.15 Final Import Check:**
+        - Verify all imports after refinements.
+    - [ ] **9.16 Example Script Update:**
+        - Update `examples/run_distributed.py` to use configuration objects, etc.
 
 - [ ] **10. Delete Original File:**
     - **Goal:** Remove the old monolithic file once the refactoring is complete and verified.
-    - After successfully moving all components and verifying the example script runs correctly, delete the original `test.py` file.
+    - Delete `test.py` after addressing remaining TODOs.

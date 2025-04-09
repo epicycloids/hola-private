@@ -75,7 +75,8 @@ class LocalWorker:
                     with self.lock:  # Use lock to prevent race conditions
                         # Use GetSuggestionRequest from .messages
                         request = GetSuggestionRequest(worker_id=self.worker_id)
-                        socket.send(msgspec.json.encode(request))
+                        # Encode using msgpack for ZMQ
+                        socket.send(msgspec.msgpack.encode(request))
 
                         # Set a timeout for receiving the response
                         poller = zmq.Poller()
@@ -85,21 +86,19 @@ class LocalWorker:
                             response_bytes = socket.recv()
                             try:
                                 # Use Message union type from .messages
-                                response = msgspec.json.decode(response_bytes, type=Message)
-                            except msgspec.ValidationError as ve:
-                                # Try to decode as a more generic type
-                                self.logger.warning(f"Worker {self.worker_id}: Validation error: {ve}, trying generic decode")
-                                try:
-                                    response_dict = msgspec.json.decode(response_bytes)
-                                    if "parameters" in response_dict:
-                                        # Use GetSuggestionResponse from .messages
-                                        response = GetSuggestionResponse(parameters=response_dict.get("parameters"))
-                                    else:
-                                        self.logger.error(f"Worker {self.worker_id}: Cannot parse response: {response_dict}")
-                                        raise ValueError(f"Cannot parse response: {response_dict}")
-                                except Exception as e:
-                                    self.logger.error(f"Worker {self.worker_id}: Failed to decode response: {e}")
-                                    raise
+                                # Decode using msgpack for ZMQ
+                                response = msgspec.msgpack.decode(response_bytes, type=Message)
+                            except (msgspec.DecodeError, ValueError) as ve: # Catch msgpack errors
+                                self.logger.error(f"Worker {self.worker_id}: Failed to decode msgpack response: {ve}")
+                                raise # Reraise after logging
+                                # Original JSON fallback commented out
+                                # self.logger.warning(f"Worker {self.worker_id}: Validation error: {ve}, trying generic decode")
+                                # try:
+                                #     response_dict = msgspec.json.decode(response_bytes)
+                                #     # ... (rest of JSON fallback) ...
+                                # except Exception as e:
+                                #     self.logger.error(f"Worker {self.worker_id}: Failed to decode response: {e}")
+                                #     raise
                         else:
                             self.logger.warning(
                                 f"Worker {self.worker_id}: Response timeout, retrying..."
@@ -152,34 +151,29 @@ class LocalWorker:
                                     request = SubmitResultRequest(
                                         worker_id=self.worker_id, result=result
                                     )
-                                    socket.send(msgspec.json.encode(request))
+                                    # Encode using msgpack for ZMQ
+                                    socket.send(msgspec.msgpack.encode(request))
 
                                     # Set a timeout for receiving the response
                                     if poller.poll(10000):  # 10 second timeout
                                         response_bytes = socket.recv()
                                         try:
                                             # Use Message union type from .messages
-                                            response = msgspec.json.decode(
+                                            # Decode using msgpack for ZMQ
+                                            response = msgspec.msgpack.decode(
                                                 response_bytes, type=Message
                                             )
-                                        except msgspec.ValidationError as ve:
-                                            # Try to decode as a more generic type
-                                            self.logger.warning(f"Worker {self.worker_id}: Result submission validation error: {ve}, trying generic decode")
-                                            try:
-                                                response_dict = msgspec.json.decode(response_bytes)
-                                                if "success" in response_dict:
-                                                    # Use SubmitResultResponse from .messages
-                                                    response = SubmitResultResponse(
-                                                        success=response_dict.get("success", False),
-                                                        is_best=response_dict.get("is_best", False),
-                                                        error=response_dict.get("error")
-                                                    )
-                                                else:
-                                                    self.logger.error(f"Worker {self.worker_id}: Cannot parse result response: {response_dict}")
-                                                    raise ValueError(f"Cannot parse result response: {response_dict}")
-                                            except Exception as e:
-                                                self.logger.error(f"Worker {self.worker_id}: Failed to decode result response: {e}")
-                                                raise
+                                        except (msgspec.DecodeError, ValueError) as ve: # Catch msgpack errors
+                                            self.logger.error(f"Worker {self.worker_id}: Failed to decode msgpack result response: {ve}")
+                                            raise # Reraise after logging
+                                            # Original JSON fallback commented out
+                                            # self.logger.warning(f"Worker {self.worker_id}: Result submission validation error: {ve}, trying generic decode")
+                                            # try:
+                                            #     response_dict = msgspec.json.decode(response_bytes)
+                                            #     # ... (rest of JSON fallback) ...
+                                            # except Exception as e:
+                                            #     self.logger.error(f"Worker {self.worker_id}: Failed to decode result response: {e}")
+                                            #     raise
                                     else:
                                         self.logger.warning(
                                             f"Worker {self.worker_id}: Result submission timeout"
@@ -297,7 +291,8 @@ class LocalWorker:
                     break
                 # Use HeartbeatRequest from .messages
                 request = HeartbeatRequest(worker_id=self.worker_id)
-                socket.send(msgspec.json.encode(request))
+                # Encode using msgpack for ZMQ
+                socket.send(msgspec.msgpack.encode(request))
 
                 # Set a timeout for receiving the response
                 poller = zmq.Poller()
@@ -305,7 +300,8 @@ class LocalWorker:
 
                 if poller.poll(5000):  # 5 second timeout
                     # Use Message union type from .messages
-                    response = msgspec.json.decode(socket.recv(), type=Message)
+                    # Decode using msgpack for ZMQ
+                    response = msgspec.msgpack.decode(socket.recv(), type=Message)
                     if (
                         not isinstance(response, HeartbeatResponse)
                         or not response.success
