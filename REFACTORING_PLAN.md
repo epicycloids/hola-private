@@ -45,7 +45,7 @@ This plan outlines the steps to refactor the distributed components from `test.p
     - Move the `setup_logging` function from `test.py` into this file.
     - Ensure necessary imports are added at the top of `utils.py`: `logging`, `sys`, `os`, `datetime`.
 
-- [ ] **4. Move Scheduler Logic:**
+- [x] **4. Move Scheduler Logic:**
     - **Goal:** Encapsulate the central scheduler logic in its own module.
     - Create `hola/distributed/scheduler.py`.
     - Move the `WorkerState` class from `test.py` into this file.
@@ -54,7 +54,7 @@ This plan outlines the steps to refactor the distributed components from `test.p
         - Standard libraries: `logging`, `threading`, `time`, `os`, `msgspec`, `zmq`, `datetime`, `typing` (`Any`, `Callable`, `List`, `Dict`, `Optional`, `Union`).
         - Internal package imports: `from .messages import ...` (needed message types), `from .utils import setup_logging`, `from hola.core.coordinator import OptimizationCoordinator`, `from hola.core.parameters import ParameterName`, `from hola.core.objectives import ObjectiveName`, `from .messages import Result`.
 
-- [ ] **5. Move Worker Logic:**
+- [x] **5. Move Worker Logic:**
     - **Goal:** Isolate the worker implementation.
     - Create `hola/distributed/worker.py`.
     - Move the `LocalWorker` class from `test.py` into this file.
@@ -62,7 +62,7 @@ This plan outlines the steps to refactor the distributed components from `test.p
         - Standard libraries: `logging`, `threading`, `time`, `msgspec`, `zmq`, `typing` (`Any`, `Callable`, `Dict`, `Optional`).
         - Internal package imports: `from .messages import ...` (needed message types), `from .utils import setup_logging`, `from hola.core.objectives import ObjectiveName`, `from hola.core.parameters import ParameterName`, `from .messages import Result`.
 
-- [ ] **6. Move Server Logic:**
+- [x] **6. Move Server Logic:**
     - **Goal:** Separate the REST API server implementation.
     - Create `hola/distributed/server.py`.
     - Move the `Server` class from `test.py` into this file.
@@ -70,7 +70,7 @@ This plan outlines the steps to refactor the distributed components from `test.p
         - Standard libraries: `logging`, `threading`, `time`, `msgspec`, `zmq`, `uvicorn`, `fastapi` (`FastAPI`, `Request`), `typing` (`Any`, `List`, `Dict`, `Optional`).
         - Internal package imports: `from .messages import ...` (both ZMQ and REST message types needed), `from .utils import setup_logging`.
 
-- [ ] **7. Create Example Script:**
+- [x] **7. Create Example Script:**
     - **Goal:** Provide a standalone script demonstrating how to use the distributed components.
     - Create `examples/run_distributed.py`.
     - Copy the entire `if __name__ == "__main__":` block content from `test.py` into this new file.
