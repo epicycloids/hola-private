@@ -18,11 +18,13 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
+import numpy as np
 
 from hola.core.leaderboard import Leaderboard, Trial
 from hola.core.objectives import ObjectiveName, ObjectiveScorer
 from hola.core.parameters import ParameterName, ParameterTransformer
 from hola.core.samplers import HypercubeSampler
+from hola.core.utils import FloatArray
 
 
 @dataclass
@@ -40,6 +42,9 @@ class OptimizationCoordinator:
 
     hypercube_sampler: HypercubeSampler
     """Sampler for generating normalized parameter values."""
+
+    objective_scorer: ObjectiveScorer
+    """Scores objectives based on their configurations."""
 
     leaderboard: Leaderboard
     """Tracks and ranks all trials."""
@@ -82,10 +87,14 @@ class OptimizationCoordinator:
         :rtype: OptimizationCoordinator
         """
         objective_scorer = ObjectiveScorer.from_dict(objectives_dict)
-        leaderboard = Leaderboard(objective_scorer)
+        # Determine multigroup status from scorer
+        is_multigroup = objective_scorer.is_multigroup
+        # Initialize Leaderboard with the flag, not the scorer object
+        leaderboard = Leaderboard(is_multigroup=is_multigroup)
         parameter_transformer = ParameterTransformer.from_dict(parameters_dict)
         return cls(
             hypercube_sampler=hypercube_sampler,
+            objective_scorer=objective_scorer,
             leaderboard=leaderboard,
             parameter_transformer=parameter_transformer,
             top_frac=top_frac,
@@ -146,8 +155,20 @@ class OptimizationCoordinator:
         :return: Current trial
         :rtype: Trial | None
         """
-        # Create trial with feasibility check
+        # Check feasibility first
         feasible = self.parameter_transformer.is_feasible(parameters)
+
+        # Calculate score if feasible
+        score: Optional[float | FloatArray] = None
+        if feasible:
+            try:
+                score = self.objective_scorer.score(objectives)
+            except KeyError as e:
+                # Handle cases where objectives might be missing if loaded from old data? Or re-raise?
+                # For now, let's assume objectives dict is always complete if feasible. Re-raise.
+                raise e # Or log an error and treat as unscoreable?
+
+        # Create trial with feasibility check
         trial = Trial(
             trial_id=self.leaderboard.get_total_count(),
             objectives=objectives,
@@ -156,8 +177,12 @@ class OptimizationCoordinator:
             metadata=metadata or {},
         )
 
-        # Add trial to leaderboard
-        self.leaderboard.add(trial)
+        # Add trial to leaderboard, providing the pre-calculated score if possible
+        if feasible and score is not None and np.all(np.isfinite(score)): # Check score is finite
+            self.leaderboard.add(trial, score)
+        else:
+            # Add trial without score (will be stored but not ranked)
+            self.leaderboard.add(trial, None)
 
         # Fit sampler if enough samples are available
         if feasible and self.top_frac * self.leaderboard.get_feasible_count() >= self.minimum_fit_samples:
@@ -303,7 +328,7 @@ class OptimizationCoordinator:
         :return: True if using multiple objective comparison groups, False if using a single group
         :rtype: bool
         """
-        return self.leaderboard._objective_scorer.is_multigroup
+        return self.objective_scorer.is_multigroup
 
     def save_to_file(self, filepath: str) -> None:
         """
@@ -338,7 +363,7 @@ class OptimizationCoordinator:
 
         # Save objective scorer
         objective_file = os.path.join(temp_dir, "objectives.json")
-        self.leaderboard._objective_scorer.save_to_file(objective_file)
+        self.objective_scorer.save_to_file(objective_file)
 
         # Save leaderboard (trials data)
         leaderboard_file = os.path.join(temp_dir, "leaderboard.json")
@@ -405,12 +430,15 @@ class OptimizationCoordinator:
         hypercube_sampler = create_sampler_from_state(sampler_state)
 
         # Load leaderboard
+        # Pass the loaded scorer instance to Leaderboard.load_from_file
+        # It will use the scorer to recalculate scores and check multigroup consistency.
         leaderboard_file = os.path.join(temp_dir, "leaderboard.json")
         leaderboard = Leaderboard.load_from_file(leaderboard_file, objective_scorer)
 
         # Create coordinator
         coordinator = cls(
             hypercube_sampler=hypercube_sampler,
+            objective_scorer=objective_scorer,
             leaderboard=leaderboard,
             parameter_transformer=parameter_transformer,
             top_frac=config.get("top_frac", 0.2),
@@ -504,39 +532,36 @@ if __name__ == "__main__":
         for params in params_list:
             objectives = evaluate(**params)
 
-            # Check parameter feasibility
-            feasible = coordinator.parameter_transformer.is_feasible(params)
-
-            # Check objective scores
-            scores = coordinator.leaderboard._objective_scorer.score(objectives)
-            has_infinite_scores = any(score == float("inf") for score in scores)
-
-            if feasible:
-                feasible_count += 1
-                if has_infinite_scores:
-                    infinite_scores_count += 1
-                    print(f"  Trial has infinite objective scores: {objectives}")
+            # The example run's logic for tracking/printing feasibility/infinite scores
+            # needs adjustment as this info isn't directly returned by record_evaluation anymore.
+            # We'll simplify the print statements for now. A more robust example
+            # would inspect the returned trial or query the leaderboard stats.
+            new_trial = coordinator.record_evaluation(params, objectives, metadata)
+            if new_trial:
+                if not new_trial.is_feasible:
+                    infeasible_count += 1
+                    # print(f"  Trial {new_trial.trial_id} has infeasible parameters: {params}") # Redundant maybe
+                else:
+                    # Check if it was ranked to infer finite scores
+                    # This requires querying the leaderboard state which might be slow in a loop
+                    # For simplicity, we just count feasible ones.
+                    feasible_count += 1
             else:
-                infeasible_count += 1
-                print(f"  Trial has infeasible parameters: {params}")
-
-            coordinator.record_evaluation(params, objectives, metadata)
+                print("  Warning: record_evaluation did not return a trial.")
 
         if (i+1) % 10 == 0:
             print(f"Progress: {i+1}/100 iterations")
-            print(f"  Feasible trials: {feasible_count}")
-            print(f"  - With finite scores: {feasible_count - infinite_scores_count}")
-            print(f"  - With infinite scores: {infinite_scores_count}")
-            print(f"  Infeasible trials: {infeasible_count}")
-            print(f"  Total trials: {feasible_count + infeasible_count}")
+            print(f"  Feasible trials recorded (approx): {feasible_count}")
+            print(f"  Infeasible trials recorded (approx): {infeasible_count}")
+            print(f"  Total trials recorded: {coordinator.get_total_evaluations()}")
             print("-"*80)
 
     # Print final statistics
     print("\nFinal Statistics:")
-    print(f"Total trials processed: {feasible_count + infeasible_count}")
-    print(f"Feasible trials: {feasible_count}")
-    print(f"- With finite scores: {feasible_count - infinite_scores_count}")
-    print(f"- With infinite scores: {infinite_scores_count}")
+    print(f"Total trials processed: {coordinator.get_total_evaluations()}")
+    print(f"Feasible trials: {coordinator.get_feasible_count()}")
+    print(f"  Ranked trials (finite scores): {coordinator.get_ranked_count()}")
+    print(f"  Feasible but unranked (e.g., infinite scores): {coordinator.get_feasible_infinite_count()}")
     print(f"Infeasible trials: {infeasible_count}")
 
     # Count trials in different data structures
@@ -545,12 +570,15 @@ if __name__ == "__main__":
     print(f"Total trials: {coordinator.get_total_evaluations()}")
     print(f"Feasible trials: {coordinator.get_feasible_count()}")
     print(f"Feasible with infinite scores: {coordinator.get_feasible_infinite_count()}")
-    print(f"Infeasible trials: {coordinator.get_infeasible_count()}")
+    print(f"Infeasible trials: {infeasible_count}")
 
     # Get and display ranked trial information
     trial_df = coordinator.get_trials_dataframe()
     print(f"\nRanked Trials DataFrame has {len(trial_df)} rows")
-    print(trial_df.head())
+    if not trial_df.empty:
+        print(trial_df.head())
+    else:
+        print("(No ranked trials)")
 
     # Get and display ALL trials including those with infinite scores
     all_trials_df = coordinator.get_all_trials_dataframe()
@@ -560,19 +588,30 @@ if __name__ == "__main__":
     print(all_trials_df.head())
 
     # Get and display metadata separately
-    metadata_df = coordinator.get_trials_metadata()
-    print(f"\nMetadata DataFrame has {len(metadata_df)} rows")
+    try:
+        metadata_df = coordinator.get_trials_metadata()
+        print(f"\nMetadata DataFrame has {len(metadata_df)} rows")
 
-    # Verify metadata is present for both ranked and unranked trials
-    ranked_ids = set(trial_df['Trial'])
-    ranked_metadata = metadata_df[metadata_df.index.isin(ranked_ids)]
-    unranked_metadata = metadata_df[~metadata_df.index.isin(ranked_ids)]
-    print(f"- Metadata entries for ranked trials: {len(ranked_metadata)}")
-    print(f"- Metadata entries for unranked trials: {len(unranked_metadata)}")
+        # Verify metadata is present for both ranked and unranked trials
+        if not trial_df.empty:
+            ranked_ids = set(trial_df['Trial'])
+            ranked_metadata = metadata_df[metadata_df.index.isin(ranked_ids)]
+            unranked_metadata = metadata_df[~metadata_df.index.isin(ranked_ids)]
+            print(f"- Metadata entries for ranked trials: {len(ranked_metadata)}")
+            print(f"- Metadata entries for unranked trials: {len(unranked_metadata)}")
+        else:
+            print("- Metadata entries for unranked trials: {len(metadata_df)}")
 
-    print("\nSample metadata for unranked trial with infinite scores:")
-    if len(unranked_metadata) > 0:
-        print(unranked_metadata.head(1))
+        print("\nSample metadata for unranked trial with infinite scores:")
+        if not metadata_df.empty and 'unranked_metadata' in locals() and not unranked_metadata.empty:
+            print(unranked_metadata.head(1))
+        elif not metadata_df.empty:
+            print(metadata_df.head(1)) # Show some metadata if only unranked exist
+        else:
+            print("(No metadata found)")
+
+    except KeyError as e:
+        print(f"Error accessing metadata, potentially due to empty leaderboard: {e}")
 
     # Display top 3 trials
     top_trials = coordinator.get_top_k_trials(3)
@@ -586,5 +625,8 @@ if __name__ == "__main__":
         print("\nTop 2 Pareto Fronts:")
         for i, front in enumerate(top_fronts):
             print(f"Front {i+1} with {len(front)} trials:")
-            for trial in front:
-                print(f"  Trial {trial.trial_id}: {trial.objectives}")
+            if front:
+                for trial in front:
+                    print(f"  Trial {trial.trial_id}: {trial.objectives}")
+            else:
+                print("  (Empty front)")

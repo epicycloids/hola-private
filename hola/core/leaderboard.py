@@ -30,9 +30,10 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 
-from hola.core.objectives import ObjectiveName, ObjectiveScorer
+from hola.core.objectives import ObjectiveName, ObjectiveScorer, GroupId, ObjectiveConfig
 from hola.core.parameters import ParameterName, CategoricalParameterConfig
 from hola.core.poset import ScalarPoset, VectorPoset
+from hola.core.utils import FloatArray
 
 
 class Trial(Struct, frozen=True):
@@ -72,17 +73,15 @@ class Leaderboard:
     ordered by crowding distance to promote diversity in parameter choices.
     """
 
-    def __init__(self, objective_scorer: ObjectiveScorer):
+    def __init__(self, is_multigroup: bool):
         """
         Initialize the leaderboard.
 
-        :param objective_scorer: Scorer that defines how to evaluate trials
-        :type objective_scorer: ObjectiveScorer
+        :param is_multigroup: Whether the optimization uses multiple comparison groups.
+        :type is_multigroup: bool
         """
-        self._objective_scorer = objective_scorer
-        self._poset = (
-            VectorPoset[int]() if self._objective_scorer.is_multigroup else ScalarPoset[int]()
-        )
+        self._is_multigroup = is_multigroup  # Store the flag
+        self._poset = VectorPoset[int]() if is_multigroup else ScalarPoset[int]()
         self._data: dict[int, Trial] = {}
 
     def get_feasible_count(self) -> int:
@@ -297,7 +296,7 @@ class Leaderboard:
                 crowding_distance = self._poset.get_crowding_distance(tid)
                 row_data["Crowding Distance"] = crowding_distance
 
-                if self._objective_scorer.is_multigroup:
+                if self._is_multigroup:
                     for j in range(len(score)):
                         row_data[f"Group {j} Score"] = score[j]
                 else:
@@ -385,25 +384,28 @@ class Leaderboard:
 
         return pd.DataFrame(metadata_rows).set_index("Trial")
 
-    def add(self, trial: Trial) -> None:
+    def add(self, trial: Trial, score: Optional[float | FloatArray] = None) -> None:
         """
-        Add a new trial to the leaderboard.
+        Add a new trial to the leaderboard, optionally providing a pre-calculated score.
 
-        All trials are stored in the data dictionary, but only feasible trials
-        with all finite scores are added to the partial ordering for ranking.
-
-        Trials with infinite scores or that violate feasibility constraints
-        are stored but not ranked.
+        Stores all trials in the internal data dictionary.
+        If a trial is feasible and a finite score is provided, it is added to the
+        partial ordering (poset) for ranking.
 
         :param trial: Trial to add
         :type trial: Trial
+        :param score: Pre-calculated objective score(s) for the trial, defaults to None
+        :type score: Optional[float | FloatArray]
         """
         index = trial.trial_id
         self._data[index] = trial
-        if trial.is_feasible:
-            group_values = self._objective_scorer.score(trial.objectives)
-            if np.all(group_values < float("inf")):
-                self._poset.add(index, group_values)
+
+        # Add to poset only if feasible, score is provided, and score is finite
+        if trial.is_feasible and score is not None:
+            # Ensure score is numpy array for np.all check, even if scalar
+            score_arr = np.atleast_1d(score)
+            if np.all(np.isfinite(score_arr)):
+                self._poset.add(index, score)
 
     def save_to_file(self, filepath: str) -> None:
         """
@@ -421,7 +423,7 @@ class Leaderboard:
         # Create output structure with trials list
         output = {
             "trials": list(self._data.values()),
-            "is_multigroup": self._objective_scorer.is_multigroup
+            "is_multigroup": self._is_multigroup
         }
 
         # Encode and write to file
@@ -455,39 +457,56 @@ class Leaderboard:
         with open(filepath, 'rb') as f:
             data = msgspec.json.decode(f.read(), type=dict[str, Any])
 
+        # Read multigroup flag from file
+        file_is_multigroup = data.get("is_multigroup", False) # Default to False if missing?
+
         # Verify compatibility with the provided objective_scorer
-        if data.get("is_multigroup") != objective_scorer.is_multigroup:
+        if file_is_multigroup != objective_scorer.is_multigroup:
             raise ValueError(
                 "Mismatch between loaded file and provided objective_scorer. "
-                f"File has is_multigroup={data.get('is_multigroup')}, but "
+                f"File has is_multigroup={file_is_multigroup}, but "
                 f"objective_scorer has is_multigroup={objective_scorer.is_multigroup}"
             )
 
-        # Create new leaderboard
-        leaderboard = cls(objective_scorer)
+        # Create new leaderboard using the flag from the file
+        leaderboard = cls(is_multigroup=file_is_multigroup)
 
-        # Manually deserialize and add trials
+        # Manually deserialize trials to handle potential None objectives
         for trial_data in data.get("trials", []):
-            # Make sure all objective values are floats (no None values)
+            # Ensure objective values are floats, converting None to inf
+            objectives_dict = {}
             if "objectives" in trial_data:
-                objectives_dict = {}
                 for obj_name, obj_value in trial_data["objectives"].items():
-                    # Convert None to infinity to ensure it's a float
                     if obj_value is None:
                         obj_value = float('inf')
                     objectives_dict[ObjectiveName(obj_name)] = float(obj_value)
 
-                # Create the trial
-                trial = Trial(
-                    trial_id=trial_data["trial_id"],
-                    objectives=objectives_dict,
-                    parameters={ParameterName(k): v for k, v in trial_data.get("parameters", {}).items()},
-                    is_feasible=trial_data.get("is_feasible", True),
-                    metadata=trial_data.get("metadata", {})
-                )
+            # Create the Trial object
+            trial = Trial(
+                trial_id=trial_data["trial_id"],
+                objectives=objectives_dict,
+                parameters={ParameterName(k): v for k, v in trial_data.get("parameters", {}).items()},
+                is_feasible=trial_data.get("is_feasible", True),
+                metadata=trial_data.get("metadata", {})
+            )
 
-                # Add the trial to the leaderboard
-                leaderboard.add(trial)
+            # Recalculate the score based on the loaded objectives and the provided scorer
+            score: Optional[float | FloatArray] = None
+            if trial.is_feasible:
+                try:
+                    calculated_score = objective_scorer.score(trial.objectives)
+                    # Check if score is finite before assigning
+                    score_arr = np.atleast_1d(calculated_score)
+                    if np.all(np.isfinite(score_arr)):
+                        score = calculated_score
+                except KeyError as e:
+                    # This might happen if objective config changed since saving
+                    # Log this or handle appropriately? For now, trial won't be ranked.
+                    print(f"Warning: Could not score trial {trial.trial_id} during load: {e}")
+                    pass # Score remains None
+
+            # Add the trial using the modified add method, which handles poset insertion
+            leaderboard.add(trial, score)
 
         return leaderboard
 
@@ -525,7 +544,7 @@ class Leaderboard:
         df_ranked = self.get_dataframe(ranked_only=True)
         front_indices = {}
 
-        if not self._objective_scorer.is_multigroup and len(self._poset) > 0:
+        if not self._is_multigroup and len(self._poset) > 0:
             # For single-group, use the order in the poset as the front index
             for i, (tid, _) in enumerate(self._poset.items()):
                 front_indices[tid] = i
@@ -614,6 +633,7 @@ class Leaderboard:
         self,
         obj1: ObjectiveName,
         obj2: ObjectiveName,
+        objectives_config: dict[ObjectiveName, ObjectiveConfig],
         figsize: Tuple[int, int] = (800, 600)
     ) -> go.Figure:
         """
@@ -626,6 +646,8 @@ class Leaderboard:
         :type obj1: ObjectiveName
         :param obj2: Name of the second objective to plot on y-axis
         :type obj2: ObjectiveName
+        :param objectives_config: Dictionary mapping objective names to their configurations.
+        :type objectives_config: dict[ObjectiveName, ObjectiveConfig]
         :param figsize: Width and height of the figure in pixels
         :type figsize: Tuple[int, int]
         :return: Plotly figure object
@@ -645,7 +667,7 @@ class Leaderboard:
         df_ranked = self.get_dataframe(ranked_only=True)
         front_indices = {}
 
-        if not self._objective_scorer.is_multigroup and len(self._poset) > 0:
+        if not self._is_multigroup and len(self._poset) > 0:
             # For single-group, use the order in the poset as the front index
             for i, (tid, _) in enumerate(self._poset.items()):
                 front_indices[tid] = i
@@ -674,10 +696,10 @@ class Leaderboard:
             width=figsize[0],
         )
 
-        # Get target and limit values for objectives
-        if obj1 in self._objective_scorer.objectives and obj2 in self._objective_scorer.objectives:
-            obj1_config = self._objective_scorer.objectives[obj1]
-            obj2_config = self._objective_scorer.objectives[obj2]
+        # Get target and limit values from the provided config
+        if obj1 in objectives_config and obj2 in objectives_config:
+            obj1_config = objectives_config[obj1]
+            obj2_config = objectives_config[obj2]
 
             # Add target and limit lines for objective 1
             fig.add_shape(
@@ -783,7 +805,7 @@ class Leaderboard:
         :raises ValueError: If comparison group IDs are not found or for single-group problems
         """
         # Verify multi-group configuration
-        if not self._objective_scorer.is_multigroup:
+        if not self._is_multigroup:
             raise ValueError("This method is only applicable for multi-group optimization problems")
 
         # Get data from leaderboard
@@ -856,7 +878,7 @@ class Leaderboard:
         :raises ValueError: If comparison group IDs are not found or for single-group problems
         """
         # Verify multi-group configuration
-        if not self._objective_scorer.is_multigroup:
+        if not self._is_multigroup:
             raise ValueError("This method is only applicable for multi-group optimization problems")
 
         # Get data from leaderboard
@@ -916,6 +938,7 @@ class Leaderboard:
     def plot_objective_vs_trial(
         self,
         objective: ObjectiveName,
+        objectives_config: dict[ObjectiveName, ObjectiveConfig],
         figsize: Tuple[int, int] = (800, 600)
     ) -> go.Figure:
         """
@@ -925,6 +948,8 @@ class Leaderboard:
 
         :param objective: Name of the objective to plot
         :type objective: ObjectiveName
+        :param objectives_config: Dictionary mapping objective names to their configurations.
+        :type objectives_config: dict[ObjectiveName, ObjectiveConfig]
         :param figsize: Width and height of the figure in pixels
         :type figsize: Tuple[int, int]
         :return: Plotly figure object
@@ -954,9 +979,9 @@ class Leaderboard:
             marker=dict(size=8)
         ))
 
-        # Add target and limit lines if available
-        if objective in self._objective_scorer.objectives:
-            obj_config = self._objective_scorer.objectives[objective]
+        # Add target and limit lines from the provided config
+        if objective in objectives_config:
+            obj_config = objectives_config[objective]
 
             # Add target line
             fig.add_trace(go.Scatter(
@@ -994,15 +1019,6 @@ class Leaderboard:
 
         return fig
 
-    def get_objective_names(self) -> list[ObjectiveName]:
-        """
-        Get all objective names defined in the leaderboard.
-
-        :return: List of objective names
-        :rtype: list[ObjectiveName]
-        """
-        return list(self._objective_scorer.objectives.keys())
-
     def get_parameter_names(self) -> list[ParameterName]:
         """
         Get all parameter names used by trials in the leaderboard.
@@ -1027,7 +1043,7 @@ class Leaderboard:
         :return: List of comparison group IDs
         :rtype: list[int]
         """
-        if not self._objective_scorer.is_multigroup:
+        if not self._is_multigroup:
             return [0]  # Single group optimization has only group 0
 
         # For multi-group, determine the number of groups from the first ranked trial
@@ -1037,8 +1053,16 @@ class Leaderboard:
             return list(range(len(score)))
 
         # If no ranked trials, try to get group count from the objective scorer
-        if hasattr(self._objective_scorer, 'group_count'):
-            return list(range(self._objective_scorer.group_count))
+        # Cannot access scorer anymore. This path is likely not robust anyway.
+        # If there are no ranked trials in a multigroup setting, we might not know the group count.
+        # However, the _is_multigroup flag should be definitive. If it's True, but no trials
+        # are ranked yet, returning [] seems reasonable.
+
+        # If multigroup and no ranked trials, return empty list? Or rely on constructor flag?
+        # The _poset type should reflect the multigroup status. If VectorPoset exists,
+        # it implies multigroup, even if empty.
+        # Let's assume if self._is_multigroup is True, we expect multiple groups, even if empty.
+        # But how many? We can't know from the leaderboard alone. Returning [] seems safest.
 
         # Last resort: we don't know how many groups there are
         return []

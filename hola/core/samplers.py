@@ -10,7 +10,7 @@ The samplers follow a common interface defined by the HypercubeSampler
 protocol, allowing them to be used interchangeably in the optimization process.
 """
 
-from typing import Protocol, TypeAlias, Union, Dict, Any, Tuple
+from typing import Protocol, Dict, Any, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -19,19 +19,6 @@ from scipy.stats.qmc import Sobol
 from sklearn.mixture import GaussianMixture
 
 from hola.core.utils import uniform_to_category
-
-
-# Permanent tags for sampler types to ensure serialization compatibility
-# if class names change in the future
-SAMPLER_TAGS = {
-    "uniform": "UniformSampler",
-    "sobol": "SobolSampler",
-    "gmm": "ClippedGaussianMixtureSampler",
-    "explore_exploit": "ExploreExploitSampler"
-}
-
-# Reverse mapping for lookup
-SAMPLER_CLASSES = {v: k for k, v in SAMPLER_TAGS.items()}
 
 
 class HypercubeSampler(Protocol):
@@ -104,6 +91,7 @@ class UniformSampler:
 
     This sampler draws samples independently and uniformly from [0,1]^d.
     """
+    sampler_tag = "uniform"
 
     def __init__(self, dimension: int):
         """
@@ -116,6 +104,22 @@ class UniformSampler:
         if dimension <= 0:
             raise ValueError("dimension must be positive.")
         self._dimension = dimension
+
+    @classmethod
+    def from_state(cls, state: Dict[str, Any]) -> "UniformSampler":
+        """
+        Create a UniformSampler instance from a state dictionary.
+
+        :param state: Dictionary containing the sampler state
+        :type state: Dict[str, Any]
+        :return: A new UniformSampler instance
+        :rtype: UniformSampler
+        :raises ValueError: If state is missing 'dimension'
+        """
+        dimension = state.get("dimension")
+        if dimension is None:
+            raise ValueError("State must include 'dimension'.")
+        return cls(dimension=dimension)
 
     @property
     def dimension(self) -> int:
@@ -142,7 +146,7 @@ class UniformSampler:
         samples = np.random.rand(n_samples, self.dimension)
         metadata = {
             "sampler_type": "uniform",
-            "sampler_class": self.__class__.__name__,
+            "sampler_class": self.sampler_tag,
         }
         return samples, metadata
 
@@ -165,21 +169,9 @@ class UniformSampler:
         :rtype: Dict[str, Any]
         """
         return {
-            "type": SAMPLER_CLASSES[self.__class__.__name__],
+            "type": self.sampler_tag,
             "dimension": self.dimension
         }
-
-    def set_state(self, state: Dict[str, Any]) -> None:
-        """
-        Restore the sampler's state from a serialized representation.
-
-        For UniformSampler, this is a no-op since it's stateless.
-
-        :param state: Dictionary containing the sampler state
-        :type state: Dict[str, Any]
-        """
-        # No state to restore for uniform sampler
-        pass
 
 
 class SobolSampler:
@@ -189,6 +181,7 @@ class SobolSampler:
     This sampler generates low-discrepancy sequences that provide better space
     coverage than uniform random sampling.
     """
+    sampler_tag = "sobol"
 
     def __init__(self, dimension: int, sampler: Sobol | None = None):
         """
@@ -204,6 +197,30 @@ class SobolSampler:
             raise ValueError("dimension must be positive.")
         self._dimension = dimension
         self._sampler = sampler if sampler is not None else Sobol(dimension)
+
+    @classmethod
+    def from_state(cls, state: Dict[str, Any]) -> "SobolSampler":
+        """
+        Create a SobolSampler instance from a state dictionary.
+
+        Restores the sequence state based on 'num_generated'.
+
+        :param state: Dictionary containing the sampler state
+        :type state: Dict[str, Any]
+        :return: A new SobolSampler instance
+        :rtype: SobolSampler
+        :raises ValueError: If state is missing 'dimension'
+        """
+        dimension = state.get("dimension")
+        if dimension is None:
+            raise ValueError("State must include 'dimension'.")
+
+        sampler = Sobol(dimension)
+        num_generated = state.get("num_generated", 0)
+        if num_generated > 0:
+            sampler.fast_forward(num_generated)
+
+        return cls(dimension=dimension, sampler=sampler)
 
     @property
     def dimension(self) -> int:
@@ -230,7 +247,7 @@ class SobolSampler:
         samples = self._sampler.random(n_samples).astype(np.float64)
         metadata = {
             "sampler_type": "quasi-random",
-            "sampler_class": self.__class__.__name__,
+            "sampler_class": self.sampler_tag,
             "sequence_type": "sobol",
         }
         return samples, metadata
@@ -254,35 +271,10 @@ class SobolSampler:
         :rtype: Dict[str, Any]
         """
         return {
-            "type": SAMPLER_CLASSES[self.__class__.__name__],
+            "type": self.sampler_tag,
             "dimension": self.dimension,
-            # Store the Sobol sampler's state - specifically the number of points generated
             "num_generated": int(self._sampler.num_generated)
         }
-
-    def set_state(self, state: Dict[str, Any]) -> None:
-        """
-        Restore the sampler's state from a serialized representation.
-
-        For SobolSampler, this restores the state of the Sobol sequence.
-
-        :param state: Dictionary containing the sampler state
-        :type state: Dict[str, Any]
-        """
-        # Create a new Sobol sampler
-        self._sampler = Sobol(self.dimension)
-
-        # Fast-forward the sequence by generating and discarding points
-        num_generated = state.get("num_generated", 0)
-        if num_generated > 0:
-            # Generate dummy samples to advance the sequence
-            chunk_size = min(10000, num_generated)  # Process in chunks to avoid memory issues
-            remaining = num_generated
-
-            while remaining > 0:
-                current_chunk = min(chunk_size, remaining)
-                _ = self._sampler.random(current_chunk)
-                remaining -= current_chunk
 
 
 class ClippedGaussianMixtureSampler:
@@ -296,12 +288,14 @@ class ClippedGaussianMixtureSampler:
     2. Sampling from the chosen Gaussian
     3. Clipping the samples to [0,1]^d
     """
+    sampler_tag = "gmm"
 
     def __init__(
         self,
         dimension: int,
         n_components: int,
         reg_covar: float = 1e-6,
+        _gmm: GaussianMixture | None = None,
     ):
         """
         Initialize the GMM sampler.
@@ -312,6 +306,8 @@ class ClippedGaussianMixtureSampler:
         :type n_components: int
         :param reg_covar: Regularization for component covariances
         :type reg_covar: float
+        :param _gmm: Pre-initialized GMM instance (internal use)
+        :type _gmm: GaussianMixture | None
         """
         if dimension <= 0:
             raise ValueError("dimension must be positive.")
@@ -320,18 +316,86 @@ class ClippedGaussianMixtureSampler:
         if reg_covar < 0:
             raise ValueError("reg_covar must be non-negative.")
 
-        self._gmm = GaussianMixture(
+        self._gmm = _gmm or GaussianMixture(
             n_components=n_components,
             reg_covar=reg_covar,
             covariance_type="full",
         )
-        self._gmm_means: npt.NDArray[np.float64] | None = None
-        self._gmm_chols: npt.NDArray[np.float64] | None = None
+        # Initialize based on provided GMM or defaults
+        self._gmm_means = getattr(self._gmm, 'means_', None)
+        if hasattr(self._gmm, 'covariances_') and self._gmm.covariances_ is not None:
+            self._gmm_chols = np.linalg.cholesky(self._gmm.covariances_)
+        else:
+            self._gmm_chols = None
+
         self._n_components = n_components
         self._reg_covar = reg_covar
         self._dimension = dimension
 
         self._hypercube_sampler = UniformSampler(dimension + 1)  # Sobol' does not really make sense here because the GMM may be refitted
+
+    @classmethod
+    def from_state(cls, state: Dict[str, Any]) -> "ClippedGaussianMixtureSampler":
+        """
+        Create a ClippedGaussianMixtureSampler instance from a state dictionary.
+
+        Restores the GMM parameters if the state indicates it was fitted.
+
+        :param state: Dictionary containing the sampler state
+        :type state: Dict[str, Any]
+        :return: A new ClippedGaussianMixtureSampler instance
+        :rtype: ClippedGaussianMixtureSampler
+        :raises ValueError: If state is missing required fields or has invalid values
+        """
+        dimension = state.get("dimension")
+        n_components = state.get("n_components")
+        reg_covar = state.get("reg_covar", 1e-6) # Use default if missing
+
+        if dimension is None or n_components is None:
+            raise ValueError("State must include 'dimension' and 'n_components'.")
+
+        # Initialize GMM instance
+        gmm = GaussianMixture(
+            n_components=n_components,
+            reg_covar=reg_covar,
+            covariance_type="full",
+        )
+
+        # If the GMM was fitted, restore its parameters
+        if state.get("is_fitted", False):
+            weights = np.array(state.get("weights"))
+            means = np.array(state.get("means"))
+            covariances = np.array(state.get("covariances"))
+
+            if weights is None or means is None or covariances is None:
+                 raise ValueError("Fitted GMM state missing weights, means, or covariances.")
+
+            # Set GMM parameters directly
+            gmm.weights_ = weights
+            gmm.means_ = means
+            gmm.covariances_ = covariances
+            try:
+                gmm.precisions_cholesky_ = np.linalg.cholesky(np.linalg.inv(covariances))
+            except np.linalg.LinAlgError:
+                # Handle potential non-invertible covariance matrices
+                # This might happen with very low reg_covar or collinear data
+                # Recompute precisions from covariance during fit instead
+                # For now, we just need the cholesky of covariance for sampling
+                pass
+
+            # Initialize other required GMM attributes
+            gmm.converged_ = True
+            gmm.n_iter_ = 1
+
+        # Create the sampler instance, passing the potentially fitted GMM
+        sampler = cls(
+            dimension=dimension,
+            n_components=n_components,
+            reg_covar=reg_covar,
+            _gmm=gmm
+        )
+
+        return sampler
 
     @property
     def dimension(self) -> int:
@@ -386,7 +450,7 @@ class ClippedGaussianMixtureSampler:
 
         metadata = {
             "sampler_type": "adaptive",
-            "sampler_class": self.__class__.__name__,
+            "sampler_class": self.sampler_tag,
             "model_type": "gaussian_mixture",
             "n_components": self.n_components,
             "is_fitted": True,
@@ -436,7 +500,7 @@ class ClippedGaussianMixtureSampler:
         :rtype: Dict[str, Any]
         """
         state = {
-            "type": SAMPLER_CLASSES[self.__class__.__name__],
+            "type": self.sampler_tag,
             "dimension": self.dimension,
             "n_components": self.n_components,
             "reg_covar": self._reg_covar,
@@ -453,44 +517,6 @@ class ClippedGaussianMixtureSampler:
 
         return state
 
-    def set_state(self, state: Dict[str, Any]) -> None:
-        """
-        Restore the sampler's state from a serialized representation.
-
-        For ClippedGaussianMixtureSampler, this restores the fitted GMM if available.
-
-        :param state: Dictionary containing the sampler state
-        :type state: Dict[str, Any]
-        """
-        # Initialize the GMM
-        self._gmm = GaussianMixture(
-            n_components=self._n_components,
-            reg_covar=self._reg_covar,
-            covariance_type="full",
-        )
-
-        # If the GMM was fitted, restore its parameters
-        if state.get("is_fitted", False):
-            weights = np.array(state["weights"])
-            means = np.array(state["means"])
-            covariances = np.array(state["covariances"])
-
-            # Set GMM parameters directly
-            self._gmm.weights_ = weights
-            self._gmm.means_ = means
-            self._gmm.covariances_ = covariances
-            self._gmm.precisions_cholesky_ = np.array([
-                np.linalg.cholesky(np.linalg.inv(cov)) for cov in covariances
-            ])
-
-            # Set the derived parameters used by the sampler
-            self._gmm_means = means
-            self._gmm_chols = np.array([np.linalg.cholesky(cov) for cov in covariances])
-
-            # Initialize other required GMM attributes
-            self._gmm.converged_ = True
-            self._gmm.n_iter_ = 1
-
 
 class ExploreExploitSampler:
     """
@@ -500,11 +526,13 @@ class ExploreExploitSampler:
     exploitation strategy once sufficient samples have been collected and the
     exploit sampler has been successfully fitted to elite samples.
     """
+    sampler_tag = "explore_exploit"
 
     def __init__(
         self,
         explore_sampler: HypercubeSampler,
         exploit_sampler: HypercubeSampler,
+        _is_fitted: bool = False
     ):
         """
         Initialize the explore-exploit sampler.
@@ -513,6 +541,8 @@ class ExploreExploitSampler:
         :type explore_sampler: HypercubeSampler
         :param exploit_sampler: Sampler to use during exploitation phase
         :type exploit_sampler: HypercubeSampler
+        :param _is_fitted: Whether the exploitation phase is active (internal use)
+        :type _is_fitted: bool
         :raises ValueError: If samplers have different dimensions
         """
         if explore_sampler.dimension != exploit_sampler.dimension:
@@ -520,7 +550,39 @@ class ExploreExploitSampler:
 
         self._explore_sampler = explore_sampler
         self._exploit_sampler = exploit_sampler
-        self._is_fitted = False
+        self._is_fitted = _is_fitted
+
+    @classmethod
+    def from_state(cls, state: Dict[str, Any]) -> "ExploreExploitSampler":
+        """
+        Create an ExploreExploitSampler instance from a state dictionary.
+
+        Recursively creates the explore and exploit sub-samplers from their states.
+
+        :param state: Dictionary containing the sampler state
+        :type state: Dict[str, Any]
+        :return: A new ExploreExploitSampler instance
+        :rtype: ExploreExploitSampler
+        :raises ValueError: If state is missing sub-sampler states or they are invalid
+        """
+        explore_state = state.get("explore_sampler")
+        exploit_state = state.get("exploit_sampler")
+
+        if not explore_state or not exploit_state:
+            raise ValueError("State must include 'explore_sampler' and 'exploit_sampler' states.")
+
+        # Recursively create sub-samplers
+        # Note: This relies on the global create_sampler_from_state function
+        explore_sampler = create_sampler_from_state(explore_state)
+        exploit_sampler = create_sampler_from_state(exploit_state)
+
+        is_fitted = state.get("is_fitted", False)
+
+        return cls(
+            explore_sampler=explore_sampler,
+            exploit_sampler=exploit_sampler,
+            _is_fitted=is_fitted
+        )
 
     @property
     def dimension(self) -> int:
@@ -557,7 +619,7 @@ class ExploreExploitSampler:
 
         metadata = {
             "sampler_type": "explore_exploit",
-            "sampler_class": self.__class__.__name__,
+            "sampler_class": self.sampler_tag,
             "phase": "exploit" if is_exploit else "explore",
             "inner_sampler": inner_metadata,
         }
@@ -601,109 +663,46 @@ class ExploreExploitSampler:
         :rtype: Dict[str, Any]
         """
         return {
-            "type": SAMPLER_CLASSES[self.__class__.__name__],
+            "type": self.sampler_tag,
             "is_fitted": self._is_fitted,
             "explore_sampler": self._explore_sampler.get_state(),
             "exploit_sampler": self._exploit_sampler.get_state()
         }
 
-    def set_state(self, state: Dict[str, Any]) -> None:
-        """
-        Restore the sampler's state from a serialized representation.
 
-        For ExploreExploitSampler, this restores the state of both sub-samplers
-        and the exploitation flag.
+# --- Sampler Creation from State ---
 
-        :param state: Dictionary containing the sampler state
-        :type state: Dict[str, Any]
-        """
-        self._is_fitted = state.get("is_fitted", False)
+# Mapping from tags to actual classes for dynamic creation
+SAMPLER_CLASS_MAP = {
+    "uniform": UniformSampler,
+    "sobol": SobolSampler,
+    "gmm": ClippedGaussianMixtureSampler,
+    "explore_exploit": ExploreExploitSampler
+}
 
-        # Restore the state of both sub-samplers
-        self._explore_sampler.set_state(state.get("explore_sampler", {}))
-        self._exploit_sampler.set_state(state.get("exploit_sampler", {}))
-
-
-PredefinedSamplers: TypeAlias = Union[
-    UniformSampler,
-    SobolSampler,
-    ClippedGaussianMixtureSampler,
-    ExploreExploitSampler,
-]
-"""Type alias for all predefined sampler classes in this module."""
 
 def create_sampler_from_state(state: Dict[str, Any]) -> HypercubeSampler:
     """
-    Create a sampler instance from a serialized state.
+    Create a sampler instance from a serialized state using its `from_state` method.
 
-    This function reconstructs the appropriate sampler type based on the
-    serialized state dictionary and initializes it with the saved parameters.
+    This function looks up the appropriate sampler class based on the 'type'
+    tag in the state dictionary and calls its `from_state` classmethod.
 
-    :param state: Dictionary containing the sampler state
+    :param state: Dictionary containing the sampler state, must include 'type' key.
     :type state: Dict[str, Any]
     :return: Initialized sampler with restored state
     :rtype: HypercubeSampler
-    :raises ValueError: If the sampler type is not recognized
+    :raises ValueError: If the sampler type tag is missing or not recognized.
     """
     sampler_tag = state.get("type")
-    dimension = state.get("dimension")
+    if not sampler_tag:
+        raise ValueError("Sampler state must include a 'type' tag.")
 
-    # Get the class name from the tag
-    sampler_type = SAMPLER_TAGS.get(sampler_tag)
-    if not sampler_type:
-        # Fallback for backward compatibility - might be using the class name directly
-        sampler_type = sampler_tag
+    sampler_cls = SAMPLER_CLASS_MAP.get(sampler_tag)
+    if not sampler_cls:
+        raise ValueError(f"Unknown sampler type tag: {sampler_tag}")
 
-    if sampler_type == "ExploreExploitSampler":
-        # For ExploreExploitSampler, we need to handle sub-samplers first
-        explore_state = state.get("explore_sampler", {})
-        exploit_state = state.get("exploit_sampler", {})
-
-        # Check if both sub-sampler states are valid
-        if not explore_state.get("type") or not explore_state.get("dimension"):
-            raise ValueError("Invalid explore_sampler state in ExploreExploitSampler")
-
-        if not exploit_state.get("type") or not exploit_state.get("dimension"):
-            raise ValueError("Invalid exploit_sampler state in ExploreExploitSampler")
-
-        # Create the sub-samplers
-        explore_sampler = create_sampler_from_state(explore_state)
-        exploit_sampler = create_sampler_from_state(exploit_state)
-
-        # Create the ExploreExploitSampler
-        sampler = ExploreExploitSampler(
-            explore_sampler=explore_sampler,
-            exploit_sampler=exploit_sampler
-        )
-
-        # Set the is_fitted flag
-        sampler._is_fitted = state.get("is_fitted", False)
-
-        return sampler
-
-    # For other sampler types, check required fields
-    if not sampler_type or not dimension:
-        raise ValueError(f"Invalid sampler state: missing type or dimension. State: {state}")
-
-    if sampler_type == "UniformSampler":
-        sampler = UniformSampler(dimension)
-
-    elif sampler_type == "SobolSampler":
-        sampler = SobolSampler(dimension)
-
-    elif sampler_type == "ClippedGaussianMixtureSampler":
-        n_components = state.get("n_components", 1)
-        reg_covar = state.get("reg_covar", 1e-6)
-        sampler = ClippedGaussianMixtureSampler(
-            dimension=dimension,
-            n_components=n_components,
-            reg_covar=reg_covar
-        )
-
-    else:
-        raise ValueError(f"Unknown sampler type: {sampler_type}")
-
-    # Restore the sampler's state
-    sampler.set_state(state)
+    # Delegate creation and state restoration to the class method
+    sampler = sampler_cls.from_state(state)
 
     return sampler

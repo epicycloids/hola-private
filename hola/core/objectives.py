@@ -173,9 +173,9 @@ class ObjectiveScorer:
         :return: Configured objective scorer
         :rtype: ObjectiveScorer
         """
-        return cls(
-            objectives=msgspec.json.decode(json_str, type=dict[ObjectiveName, ObjectiveConfig])
-        )
+        # Decode the outer dictionary first, then extract the objectives dict
+        data = msgspec.json.decode(json_str, type=dict[str, dict[ObjectiveName, ObjectiveConfig]])
+        return cls(objectives=data["objectives"])
 
     def save_to_file(self, filepath: str) -> None:
         """

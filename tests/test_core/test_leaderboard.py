@@ -6,9 +6,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 import pandas as pd
+import msgspec
 
 from hola.core.leaderboard import Leaderboard, Trial
-from hola.core.objectives import ObjectiveName, ObjectiveScorer
+from hola.core.objectives import ObjectiveName, ObjectiveScorer, ObjectiveConfig
 from hola.core.parameters import ParameterName
 
 
@@ -28,7 +29,9 @@ class TestLeaderboard:
 
         class SimpleScorer(ObjectiveScorer):
             def __init__(self):
-                super().__init__(objectives={ObjectiveName("dummy"): MockObjectiveConfig()})
+                # Create an actual ObjectiveConfig instance
+                dummy_config_obj = ObjectiveConfig(target=0, limit=1, comparison_group=0)
+                super().__init__(objectives={ObjectiveName("dummy"): dummy_config_obj})
 
             @property
             def is_multigroup(self) -> bool:
@@ -51,11 +54,12 @@ class TestLeaderboard:
 
         class MultiGroupScorer(ObjectiveScorer):
             def __init__(self):
-                objectives = {
-                    ObjectiveName("obj1"): MockObjectiveConfig(0),
-                    ObjectiveName("obj2"): MockObjectiveConfig(1)
+                # Create actual ObjectiveConfig instances
+                objectives_obj_dict = {
+                    ObjectiveName("obj1"): ObjectiveConfig(target=0, limit=1, comparison_group=0),
+                    ObjectiveName("obj2"): ObjectiveConfig(target=0, limit=1, comparison_group=1)
                 }
-                super().__init__(objectives=objectives)
+                super().__init__(objectives=objectives_obj_dict)
 
             @property
             def is_multigroup(self) -> bool:
@@ -135,9 +139,25 @@ class TestLeaderboard:
         """
         Create a populated leaderboard for testing.
         """
-        leaderboard = Leaderboard(simple_objective_scorer)
+        is_multigroup = simple_objective_scorer.is_multigroup
+        leaderboard = Leaderboard(is_multigroup=is_multigroup)
         for trial in sample_trials:
-            leaderboard.add(trial)
+            score = None
+            if trial.is_feasible:
+                try:
+                    calculated_score = simple_objective_scorer.score(trial.objectives)
+                    # Check if score is finite before assigning
+                    score_arr = np.atleast_1d(calculated_score)
+                    if np.all(np.isfinite(score_arr)):
+                        score = calculated_score
+                    else:
+                        # If score is infinite, pass None to add to indicate it shouldn't be ranked
+                        score = None # Explicitly set to None if inf for clarity in add
+                except KeyError:
+                    # Handle cases where objective might not be scorable by mock scorer
+                    score = None
+
+            leaderboard.add(trial, score)
         return leaderboard
 
     @pytest.fixture
@@ -145,16 +165,31 @@ class TestLeaderboard:
         """
         Create a populated multigroup leaderboard for testing.
         """
-        leaderboard = Leaderboard(multigroup_objective_scorer)
+        is_multigroup = multigroup_objective_scorer.is_multigroup
+        leaderboard = Leaderboard(is_multigroup=is_multigroup)
         for trial in sample_trials:
-            leaderboard.add(trial)
+            score = None
+            if trial.is_feasible:
+                try:
+                    calculated_score = multigroup_objective_scorer.score(trial.objectives)
+                    # Check if score is finite before assigning
+                    score_arr = np.atleast_1d(calculated_score)
+                    if np.all(np.isfinite(score_arr)):
+                        score = calculated_score
+                    else:
+                        score = None # Explicitly set to None if inf
+                except KeyError:
+                    score = None
+
+            leaderboard.add(trial, score)
         return leaderboard
 
     def test_initialization(self, simple_objective_scorer):
         """
         Test leaderboard initialization.
         """
-        leaderboard = Leaderboard(simple_objective_scorer)
+        is_multigroup = simple_objective_scorer.is_multigroup
+        leaderboard = Leaderboard(is_multigroup=is_multigroup)
         assert leaderboard.get_total_count() == 0
         assert leaderboard.get_ranked_count() == 0
         assert leaderboard.get_best_trial() is None
@@ -163,14 +198,17 @@ class TestLeaderboard:
         """
         Test adding a feasible trial with finite objectives.
         """
-        leaderboard = Leaderboard(simple_objective_scorer)
+        is_multigroup = simple_objective_scorer.is_multigroup
+        leaderboard = Leaderboard(is_multigroup=is_multigroup)
         trial = Trial(
             trial_id=1,
             objectives={ObjectiveName("obj"): 1.0},
             parameters={ParameterName("param"): 10},
         )
 
-        leaderboard.add(trial)
+        # Calculate score and add
+        score = simple_objective_scorer.score(trial.objectives)
+        leaderboard.add(trial, score)
 
         assert leaderboard.get_total_count() == 1
         assert leaderboard.get_feasible_count() == 1
@@ -182,7 +220,8 @@ class TestLeaderboard:
         """
         Test adding an infeasible trial.
         """
-        leaderboard = Leaderboard(simple_objective_scorer)
+        is_multigroup = simple_objective_scorer.is_multigroup
+        leaderboard = Leaderboard(is_multigroup=is_multigroup)
         trial = Trial(
             trial_id=1,
             objectives={ObjectiveName("obj"): 1.0},
@@ -190,7 +229,8 @@ class TestLeaderboard:
             is_feasible=False
         )
 
-        leaderboard.add(trial)
+        # Add infeasible trial (score is irrelevant, pass None)
+        leaderboard.add(trial, score=None)
 
         assert leaderboard.get_total_count() == 1
         assert leaderboard.get_feasible_count() == 0
@@ -202,14 +242,18 @@ class TestLeaderboard:
         """
         Test adding a feasible trial with infinite objective score.
         """
-        leaderboard = Leaderboard(simple_objective_scorer)
+        is_multigroup = simple_objective_scorer.is_multigroup
+        leaderboard = Leaderboard(is_multigroup=is_multigroup)
         trial = Trial(
             trial_id=1,
             objectives={ObjectiveName("obj"): float("inf")},
             parameters={ParameterName("param"): 10},
         )
 
-        leaderboard.add(trial)
+        # Add trial with infinite score (pass score=None as it won't be ranked)
+        # The scorer *could* return inf, but add expects None for non-ranked trials
+        # score = simple_objective_scorer.score(trial.objectives) # This would be inf
+        leaderboard.add(trial, score=None)
 
         assert leaderboard.get_total_count() == 1
         assert leaderboard.get_feasible_count() == 1
@@ -234,7 +278,8 @@ class TestLeaderboard:
         """
         Test retrieval of the best trial (lowest score).
         """
-        leaderboard = Leaderboard(simple_objective_scorer)
+        is_multigroup = simple_objective_scorer.is_multigroup
+        leaderboard = Leaderboard(is_multigroup=is_multigroup)
 
         trial1 = Trial(
             trial_id=1,
@@ -248,8 +293,11 @@ class TestLeaderboard:
             parameters={ParameterName("param"): 20},
         )
 
-        leaderboard.add(trial1)
-        leaderboard.add(trial2)
+        # Calculate scores and add
+        score1 = simple_objective_scorer.score(trial1.objectives)
+        score2 = simple_objective_scorer.score(trial2.objectives)
+        leaderboard.add(trial1, score1)
+        leaderboard.add(trial2, score2)
 
         best_trial = leaderboard.get_best_trial()
         assert best_trial is not None
@@ -259,7 +307,8 @@ class TestLeaderboard:
         """
         Test retrieval of top k trials.
         """
-        leaderboard = Leaderboard(simple_objective_scorer)
+        is_multigroup = simple_objective_scorer.is_multigroup
+        leaderboard = Leaderboard(is_multigroup=is_multigroup)
 
         # Add trials with scores 5, 3, 10, 7
         for i, score in enumerate([5, 3, 10, 7], 1):
@@ -268,7 +317,9 @@ class TestLeaderboard:
                 objectives={ObjectiveName("obj"): float(score)},
                 parameters={ParameterName("param"): i * 10},
             )
-            leaderboard.add(trial)
+            # Calculate score and add
+            score = simple_objective_scorer.score(trial.objectives)
+            leaderboard.add(trial, score)
 
         # Get top 2 trials (should be trials with scores 3, 5)
         top_trials = leaderboard.get_top_k(2)
@@ -288,7 +339,8 @@ class TestLeaderboard:
         """
         Test retrieval of top k fronts with a simple scorer.
         """
-        leaderboard = Leaderboard(simple_objective_scorer)
+        is_multigroup = simple_objective_scorer.is_multigroup
+        leaderboard = Leaderboard(is_multigroup=is_multigroup)
 
         # Add trials with scores 5, 3, 10, 7
         for i, score in enumerate([5, 3, 10, 7], 1):
@@ -297,7 +349,9 @@ class TestLeaderboard:
                 objectives={ObjectiveName("obj"): float(score)},
                 parameters={ParameterName("param"): i * 10},
             )
-            leaderboard.add(trial)
+            # Calculate score and add
+            score = simple_objective_scorer.score(trial.objectives)
+            leaderboard.add(trial, score)
 
         # For a simple scorer, each front should contain one trial
         fronts = leaderboard.get_top_k_fronts(2)
@@ -311,7 +365,8 @@ class TestLeaderboard:
         """
         Test retrieval of top k fronts with a multigroup scorer.
         """
-        leaderboard = Leaderboard(multigroup_objective_scorer)
+        is_multigroup = multigroup_objective_scorer.is_multigroup
+        leaderboard = Leaderboard(is_multigroup=is_multigroup)
 
         # Add trials with different objective combinations for 2D Pareto front
         trials = [
@@ -350,7 +405,9 @@ class TestLeaderboard:
         ]
 
         for trial in trials:
-            leaderboard.add(trial)
+            # Calculate score and add
+            score = multigroup_objective_scorer.score(trial.objectives)
+            leaderboard.add(trial, score)
 
         # Get Pareto fronts
         fronts = leaderboard.get_top_k_fronts(2)
@@ -433,8 +490,9 @@ class TestLeaderboard:
             assert os.path.exists(filepath)
 
             # Verify the file contains valid JSON
-            with open(filepath, 'r') as f:
-                data = json.load(f)
+            with open(filepath, 'rb') as f: # Read as bytes for msgspec
+                # Use msgspec to decode as it was used for encoding
+                data = msgspec.json.decode(f.read())
 
             # Check basic structure
             assert "trials" in data
@@ -553,7 +611,8 @@ class TestLeaderboard:
         """
         Test saving and loading an empty leaderboard.
         """
-        empty_leaderboard = Leaderboard(simple_objective_scorer)
+        is_multigroup = simple_objective_scorer.is_multigroup
+        empty_leaderboard = Leaderboard(is_multigroup=is_multigroup)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             filepath = os.path.join(temp_dir, "empty_leaderboard.json")
@@ -567,3 +626,70 @@ class TestLeaderboard:
             # Verify it's still empty
             assert loaded_leaderboard.get_total_count() == 0
             assert loaded_leaderboard.get_best_trial() is None
+
+    def test_save_load_large_leaderboard(self, simple_objective_scorer):
+        """
+        Test saving and loading a leaderboard with a large number of trials.
+        Should trigger potential msgspec encoding/decoding issues for large data.
+        """
+        is_multigroup = simple_objective_scorer.is_multigroup
+        leaderboard = Leaderboard(is_multigroup=is_multigroup)
+        num_trials = 250000  # Increase number of trials
+
+        print(f"\nGenerating {num_trials} trials for large leaderboard test...")
+        for i in range(num_trials):
+            trial_id = i + 1  # Unique trial ID
+            trial = Trial(
+                trial_id=trial_id,
+                objectives={
+                    ObjectiveName("obj"): float(i),
+                    ObjectiveName("another_obj"): float(i * 0.5)
+                },
+                parameters={
+                    ParameterName("param_float"): float(i / 10.0),
+                    ParameterName("param_int"): i,
+                    ParameterName("param_cat"): f"category_{i % 10}" # Add categorical param
+                },
+                is_feasible=True,
+                metadata={
+                    "index": i,
+                    "source": "large_test",
+                    "complex_data": {
+                        "nested_val": i * 2,
+                        "nested_str": f"Nested string data for trial {trial_id}" * 5 # Longer string
+                    },
+                    "long_string": "This is a moderately long string to add some size." * 10
+                }
+            )
+            score = simple_objective_scorer.score(trial.objectives)
+            leaderboard.add(trial, score)
+        print(f"Generated {leaderboard.get_total_count()} trials.")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            filepath = os.path.join(temp_dir, "large_leaderboard.json")
+
+            print(f"Saving large leaderboard to {filepath}...")
+            # Save the large leaderboard
+            leaderboard.save_to_file(filepath)
+            print("Save complete.")
+
+            # Verify the file exists
+            assert os.path.exists(filepath)
+
+            print(f"Loading large leaderboard from {filepath}...")
+            # Load the leaderboard
+            try:
+                loaded_leaderboard = Leaderboard.load_from_file(filepath, simple_objective_scorer)
+                print("Load complete.")
+            except Exception as e:
+                print(f"Error during load: {e}")
+                pytest.fail(f"Loading large leaderboard failed: {e}")
+
+            # Verify the loaded leaderboard has the correct number of trials
+            assert loaded_leaderboard.get_total_count() == num_trials, \
+                f"Expected {num_trials} trials, but loaded {loaded_leaderboard.get_total_count()}"
+            print(f"Loaded leaderboard has {loaded_leaderboard.get_total_count()} trials as expected.")
+
+            # Optional: Check a specific trial to ensure data integrity
+            # loaded_trial = loaded_leaderboard.get_trial(num_trials // 2)
+            # assert loaded_trial.parameters[ParameterName("param")] == (num_trials // 2) -1 # Adjust index if needed

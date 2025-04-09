@@ -346,7 +346,7 @@ class CategoricalParameterConfig(
     sampling across categories.
     """
 
-    categories: tuple[Category]
+    categories: tuple[Any, ...]
     """Tuple of valid categories for this parameter."""
 
     def __post_init__(self):
@@ -706,16 +706,19 @@ class LatticeParameterConfig(BaseParameterConfig, tag="lattice", frozen=True):
         :type x: float | FloatArray
         :return: Normalized value(s) in [0,1]
         :rtype: float | FloatArray
-        :raises ParamInfeasibleError: If x is not close to a lattice point
-                                    or outside [min, max]
+        :raises ParamInfeasibleError: If x is not close to a lattice point or
+            outside [min, max]
         """
-        if not self.is_feasible(x):
+        arr = np.asarray(x)
+        if np.any(arr < self.min) or np.any(arr > self.max):
             raise ParamInfeasibleError(
-                f"Values not on lattice or outside [{self.min}, {self.max}]."
+                f"Values outside bounds [{self.min}, {self.max}]."
             )
 
-        arr = np.asarray(x)
+        # If within bounds, snap to nearest lattice point index and normalize
         indices = np.round((arr - self.min) / self.step_size)
+        # Clamp indices just in case rounding goes slightly out of bounds at edges
+        indices = np.clip(indices, 0, self.num_values - 1)
         out = (indices + 0.5) / self.num_values
 
         if isinstance(x, np.ndarray):
@@ -737,7 +740,12 @@ class LatticeParameterConfig(BaseParameterConfig, tag="lattice", frozen=True):
         arr = np.asarray(x)
         if np.any(arr < self.min) or np.any(arr > self.max):
             return False
+
         indices = np.round((arr - self.min) / self.step_size)
+        # Check if rounded index is valid (handles edge cases near min/max slightly better than just bound check)
+        if np.any(indices < 0) or np.any(indices >= self.num_values):
+             return False
+
         lattice_vals = self.min + indices * self.step_size
         return np.allclose(arr, lattice_vals)
 

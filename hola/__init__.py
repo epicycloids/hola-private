@@ -12,11 +12,6 @@ from hola.core.objectives import ObjectiveScorer
 from hola.core.parameters import ParameterTransformer
 import hola.core.samplers
 
-# Distributed functionality
-from hola.distributed.scheduler import OptimizationScheduler, SchedulerConfig
-from hola.distributed.server import OptimizationServer, ServerConfig
-from hola.distributed.worker import Worker, LocalWorker, RemoteWorker, WorkerConfig
-
 # Convenience function for simple optimizations
 def run_optimization(
     objective_function,
@@ -111,9 +106,6 @@ def run_optimization(
     if use_distributed:
         # Use distributed optimization
         import time
-        from hola.distributed.scheduler import OptimizationScheduler
-        from hola.distributed.server import OptimizationServer
-        from hola.distributed.worker import LocalWorker
 
         # Configure number of workers
         n_workers = n_workers or max(1, min(4, __import__('os').cpu_count() or 1))

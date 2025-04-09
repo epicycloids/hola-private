@@ -19,8 +19,8 @@ def test_min_float_tolerance():
         (0.0, 3, 0),  # Minimum boundary
         (0.999, 3, 2),  # High but under 1.0
         (1.0, 3, 2),  # Exactly 1.0 maps to the last category
-        (0.7, 3, 2),  # General case
-        (0.3, 4, 1),  # Another general case
+        (0.7, 3, 2),
+        (0.3, 4, 1),
     ],
 )
 def test_uniform_to_category_scalar(u_sample, n_categories, expected):

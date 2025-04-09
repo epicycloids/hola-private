@@ -1734,7 +1734,8 @@ if __name__ == "__main__":
         status_socket.connect("ipc:///tmp/scheduler.ipc")
 
         start_time = time.time()
-        max_runtime = 120  # Run for at most 120 seconds (2 minutes)
+        max_runtime = 600  # Run for at most 600 seconds (10 minutes)
+        target_evaluations = 2000 # Target number of evaluations
 
         while time.time() - start_time < max_runtime:
             # Request status from scheduler
@@ -1750,18 +1751,20 @@ if __name__ == "__main__":
                     total_evaluations = status_response.total_evaluations
                     main_logger.info(
                         f"Main loop: {current_workers} active workers, "
-                        f"total_evaluations: {total_evaluations}, "
-                        f"time elapsed: {time.time() - start_time:.1f}s"
+                        f"total_evaluations: {total_evaluations}/{target_evaluations}, "
+                        f"time elapsed: {time.time() - start_time:.1f}s / {max_runtime}s"
                     )
 
                     # End early if we've done enough evaluations
-                    if total_evaluations >= 50:  # Reduced target for the simpler problem
-                        main_logger.info("Reached target number of evaluations")
+                    if total_evaluations >= target_evaluations:
+                        main_logger.info(f"Reached target number of {target_evaluations} evaluations")
                         break
             else:
                 main_logger.warning("Status request timeout")
 
             time.sleep(1)
+        else: # Executed if the loop finished due to timeout
+            main_logger.warning(f"Reached maximum runtime of {max_runtime} seconds.")
 
         # Clean up and report results
         time.sleep(0.5)
@@ -1788,6 +1791,56 @@ if __name__ == "__main__":
 
         main_logger.info("Initiating final shutdown sequence")
         shutdown_system(scheduler_process, server)
+
+        # --- Add loading test ---
+        main_logger.info("Attempting to reload the saved coordinator state...")
+        try:
+            # Find the latest run directory in optimization_results
+            base_save_dir = "optimization_results"
+            run_dirs = [d for d in os.listdir(base_save_dir) if os.path.isdir(os.path.join(base_save_dir, d)) and d.startswith("run_")]
+            if not run_dirs:
+                main_logger.error("No run directories found in optimization_results.")
+            else:
+                latest_run_dir = max(run_dirs, key=lambda d: os.path.getmtime(os.path.join(base_save_dir, d)))
+                load_path = os.path.join(base_save_dir, latest_run_dir, "coordinator_state.json")
+
+                if os.path.exists(load_path):
+                    main_logger.info(f"Found coordinator state file: {load_path}")
+
+                    # Recreate the sampler needed for loading (though state is in file)
+                    # The specific state of the sampler doesn't matter for just loading the leaderboard data
+                    dimension = len(parameters_dict)
+                    explore_sampler_load = SobolSampler(dimension=dimension)
+                    exploit_sampler_load = ClippedGaussianMixtureSampler(dimension=dimension, n_components=2)
+                    hypercube_sampler_load = ExploreExploitSampler(
+                        explore_sampler=explore_sampler_load,
+                        exploit_sampler=exploit_sampler_load
+                    )
+
+                    start_load_time = time.time()
+                    loaded_coordinator = OptimizationCoordinator.load_from_file(
+                        filepath=load_path,
+                    )
+                    load_duration = time.time() - start_load_time
+                    main_logger.info(f"Successfully loaded coordinator state in {load_duration:.2f} seconds.")
+                    main_logger.info(f"Loaded leaderboard contains {loaded_coordinator.get_total_evaluations()} trials.")
+
+                    # Optional: Perform a basic check on the loaded data
+                    if loaded_coordinator.get_total_evaluations() > 0:
+                        best_trial = loaded_coordinator.get_best_trial()
+                        if best_trial:
+                             main_logger.info(f"Best trial from loaded state: ID {best_trial.trial_id}, Objectives {best_trial.objectives}")
+                        else:
+                             main_logger.info("Loaded state has trials but no single best trial (possibly multigroup).")
+                    else:
+                        main_logger.info("Loaded state has 0 trials.")
+
+                else:
+                    main_logger.error(f"Coordinator state file not found at expected path: {load_path}")
+
+        except Exception as e:
+            main_logger.error(f"Failed to load coordinator state: {e}", exc_info=True)
+        # --- End loading test ---
 
     except KeyboardInterrupt:
         main_logger.info("\nReceived interrupt signal")

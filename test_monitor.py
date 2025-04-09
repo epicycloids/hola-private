@@ -249,7 +249,7 @@ def _(mo):
 @app.cell
 def _(leaderboard, mo):
     available_params = leaderboard.get_parameter_names() if leaderboard is not None else []
-    available_objs = leaderboard.get_objective_names() if leaderboard is not None else []
+    available_objs = ["objective1", "objective2", "objective3"] #leaderboard.get_objective_names() if leaderboard is not None else []
     available_cgs = leaderboard.get_comparison_group_ids() if leaderboard is not None else []
 
     p1val, p2val = None, None
@@ -352,7 +352,7 @@ def _(available_cgs, available_objs, mo):
     def show_plots(leaderboard, p1, p2, objs1, objs2, objs3, cgs1, cgs2, cgs3):
         if leaderboard is None:
             return None
-        
+
         param_fig = None
         if p1.value is not None:
             param_fig = leaderboard.plot_parameters(p1.value, p2.value)
