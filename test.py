@@ -21,39 +21,6 @@ from hola.core.parameters import ParameterName
 from hola.core.samplers import SobolSampler, ClippedGaussianMixtureSampler, ExploreExploitSampler
 
 # ============================================================================
-# Logging Setup
-# ============================================================================
-
-
-def setup_logging(name: str, level: int = logging.INFO) -> logging.Logger:
-    """Configure logging for a component with console and file handlers."""
-    logger = logging.getLogger(name)
-    logger.setLevel(level)
-
-    # Create formatter
-    formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
-
-    # Create console handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-
-    # Create logs directory if it doesn't exist
-    logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
-    os.makedirs(logs_dir, exist_ok=True)
-
-    # Create file handler in the logs directory
-    log_file_path = os.path.join(logs_dir, f'scheduler_{name}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
-    file_handler = logging.FileHandler(log_file_path)
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-
-    return logger
-
-
-# ============================================================================
 # Message Types
 # ============================================================================
 
@@ -1137,73 +1104,6 @@ class LocalWorker:
             # Re-raise to allow the worker to handle this failure
             # The heartbeat mechanism will ensure the scheduler knows this worker is still alive
             raise
-
-
-# ============================================================================
-# REST API Messages
-# ============================================================================
-
-
-class RESTGetSuggestionResponse(msgspec.Struct):
-    """Response to GET /job containing parameter suggestions."""
-
-    parameters: dict[ParameterName, Any] | None = None
-    error: str | None = None
-
-
-class RESTSubmitResult(msgspec.Struct):
-    """Request body for POST /result containing evaluation results."""
-
-    parameters: dict[ParameterName, Any]
-    objectives: dict[ObjectiveName, float]
-
-
-class RESTSubmitResponse(msgspec.Struct):
-    """Response to POST /result indicating success/failure."""
-
-    success: bool
-    error: str | None = None
-
-
-class RESTHeartbeatRequest(msgspec.Struct):
-    """Request body for POST /heartbeat."""
-
-    worker_id: int
-
-
-class RESTHeartbeatResponse(msgspec.Struct):
-    """Response to POST /heartbeat."""
-
-    success: bool
-    error: str | None = None
-
-
-class RESTGetTrialsResponse(msgspec.Struct):
-    """Response to GET /trials."""
-
-    trials: List[Dict[str, Any]]
-    error: str | None = None
-
-
-class RESTGetMetadataResponse(msgspec.Struct):
-    """Response to GET /metadata."""
-
-    metadata: List[Dict[str, Any]]
-    error: str | None = None
-
-
-class RESTGetTopKResponse(msgspec.Struct):
-    """Response to GET /top."""
-
-    trials: List[Dict[str, Any]]
-    error: str | None = None
-
-
-class RESTIsMultiGroupResponse(msgspec.Struct):
-    """Response to GET /is_multi_group."""
-
-    is_multi_group: bool
-    error: str | None = None
 
 
 # ============================================================================

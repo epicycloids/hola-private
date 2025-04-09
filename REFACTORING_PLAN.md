@@ -2,7 +2,7 @@
 
 This plan outlines the steps to refactor the distributed components from `test.py` into a dedicated `hola/distributed` package and create a runnable example script.
 
-- [ ] **1. Create Directory Structure:**
+- [x] **1. Create Directory Structure:**
     - **Goal:** Establish the necessary directories for the new package structure.
     - Create `hola/distributed/` for the distributed system components (scheduler, worker, server, messages, utils).
     - Create `examples/` at the root level for the runnable example script (`run_distributed.py`).
@@ -28,7 +28,7 @@ This plan outlines the steps to refactor the distributed components from `test.p
     test.py               <-- To be deleted later
     ```
 
-- [ ] **2. Move Message Definitions:**
+- [x] **2. Move Message Definitions:**
     - **Goal:** Centralize all message structures (`msgspec.Struct`) used for communication.
     - Create `hola/distributed/messages.py`.
     - Move all `msgspec.Struct` definitions from `test.py` into this file. This includes:
@@ -39,7 +39,7 @@ This plan outlines the steps to refactor the distributed components from `test.p
     - Move the `Message` union type definition (`Message = GetSuggestionRequest | ...`) into this file.
     - Ensure necessary imports are added at the top of `messages.py`: `msgspec`, `typing` (`Any`, `List`, `Dict`, `Optional`, `Union`), and potentially `hola.core.parameters.ParameterName`, `hola.core.objectives.ObjectiveName`.
 
-- [ ] **3. Move Utility Functions:**
+- [x] **3. Move Utility Functions:**
     - **Goal:** Isolate general utility functions used by the distributed components.
     - Create `hola/distributed/utils.py`.
     - Move the `setup_logging` function from `test.py` into this file.
@@ -86,19 +86,22 @@ This plan outlines the steps to refactor the distributed components from `test.p
         - Standard libraries: `multiprocessing as mp`, `os`, `random`, `time`, `zmq`, `msgspec`, `numpy as np`.
         - `from typing import Callable, Dict` (for type hints in moved functions).
 
-- [ ] **8. Create `__init__.py` files:**
+- [x] **8. Create `__init__.py` files:**
     - **Goal:** Ensure the new directories are treated as Python packages.
     - Create an empty file `hola/distributed/__init__.py`.
     - Verify that `hola/core/__init__.py` and `hola/__init__.py` already exist (they likely do).
 
 - [ ] **9. Refinement and Cleanup (Post-Move):**
     - **Goal:** Address remaining inconsistencies, potential improvements, and documentation after the structural changes are complete.
+    - **Unit Testing:** Implement comprehensive unit tests for the new distributed components (`scheduler`, `worker`, `server`, `messages`, `utils`) to ensure correctness and prevent regressions.
+    - **Docstring Style:** Ensure all docstrings in the new modules adhere to the reStructuredText (reST) format compatible with Sphinx, matching the style of the existing `hola.core` modules.
+    - **Convenience Entrypoint:** Create a high-level function (e.g., `run_local_distributed`) that simplifies running an optimization locally using the distributed components. This function should accept the objective function, parameter/objective configuration, number of workers, and manage the setup/teardown of the scheduler and local workers.
     - **Redundancy (REST vs ZMQ Messages):** Review the duplicated message definitions in `messages.py`. Consider if REST responses can directly use or adapt ZMQ structs to reduce code.
     - **Worker ID for REST:** Evaluate the temporary negative `worker_id` assignment in `Server`. Consider if a more robust UUID or registration mechanism is needed.
     - **Configuration:** Identify hardcoded values (ZMQ addresses, ports, timeouts, save intervals) in `scheduler.py`, `worker.py`, `server.py`, and `run_distributed.py`. Plan to move these into configuration objects (e.g., dataclasses, Pydantic models) for better flexibility.
     - **Error Handling:** Review error handling loops (like `MAX_CONSECUTIVE_ERRORS`) for consistency and robustness.
     - **Imports:** Perform a final check of all relative and absolute imports across all modified and new files.
-    - **Docstrings:** Add module-level docstrings to the new files (`messages.py`, `scheduler.py`, etc.). Review and update existing docstrings for classes and functions that were moved.
+    - **Docstrings (Module/Class Level):** Add module-level docstrings to the new files (`messages.py`, `scheduler.py`, etc.). Review and update existing docstrings for classes and functions that were moved.
 
 - [ ] **10. Delete Original File:**
     - **Goal:** Remove the old monolithic file once the refactoring is complete and verified.
